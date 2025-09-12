@@ -60,6 +60,24 @@ let TRANSFORM_THREAD_MAX_MESSAGE_AGE_MS = (
     : 30 // défaut 30 minutes
 ) * 60 * 1000;
 
+// Durée d'auto-archivage configurable (Discord supporte: 60, 1440, 4320, 10080 minutes => 1h, 24h, 3d, 7d)
+// Valeurs admises dans config: "1h", "24h", "3d", "1w" (week=7d)
+let THREAD_AUTO_ARCHIVE_DURATION = ThreadAutoArchiveDuration.OneDay;
+try {
+  const mapDur = {
+    '1h': ThreadAutoArchiveDuration.OneHour,
+    '24h': ThreadAutoArchiveDuration.OneDay,
+    '3d': ThreadAutoArchiveDuration.ThreeDays,
+    '1w': ThreadAutoArchiveDuration.OneWeek
+  };
+  if (typeof CONFIG.threadAutoArchiveDuration === 'string') {
+    const key = CONFIG.threadAutoArchiveDuration.trim().toLowerCase();
+    if (mapDur[key] !== undefined) {
+      THREAD_AUTO_ARCHIVE_DURATION = mapDur[key];
+    }
+  }
+} catch (e) { console.warn('threadAutoArchiveDuration invalide, utilisation défaut 24h'); }
+
 function isChannelAllowed(channel) {
   if (!WHITELIST.length) return true; // pas de restriction
   if (channel.isThread?.()) {
@@ -675,13 +693,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       const sourceMessage = interaction.message;
       const parentChannel = sourceMessage.channel;
-      // Vérification de l'âge du message (sécurité: transformation seulement messages récents)
+      // Vérification de l'âge du message (sauf pour admins)
+      const isAdminUser = isAdmin(interaction.user.id, interaction.member);
       try {
-        if (TRANSFORM_THREAD_MAX_MESSAGE_AGE_MS > 0) {
+        if (!isAdminUser && TRANSFORM_THREAD_MAX_MESSAGE_AGE_MS > 0) {
           const ageMs = Date.now() - (sourceMessage.createdTimestamp || 0);
           if (ageMs > TRANSFORM_THREAD_MAX_MESSAGE_AGE_MS) {
             if (!interaction.replied && !interaction.deferred) {
-              await interaction.reply({ content: 'Délai expiré: ce message est trop ancien pour être transformé en thread.', flags: MessageFlags.Ephemeral });
+              await interaction.reply({ content: 'Délai expiré (admins exemptés): message trop ancien pour être transformé en thread.', flags: MessageFlags.Ephemeral });
             }
             return;
           }
@@ -695,7 +714,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       try {
         await ensureDb();
         // Vérification cooldown global par utilisateur
-        if (TRANSFORM_THREAD_COOLDOWN_MS > 0) {
+  if (!isAdminUser && TRANSFORM_THREAD_COOLDOWN_MS > 0) {
           try {
             const lastTs = await getLastTransformTs(interaction.user.id);
             if (lastTs) {
@@ -714,7 +733,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           } catch (e) { console.error('cooldown check error', e); }
         }
         // Vérification unique par message
-        if (await hasUserTransformed(sourceMessage.id, interaction.user.id)) {
+  if (!isAdminUser && await hasUserTransformed(sourceMessage.id, interaction.user.id)) {
           if(!interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Tu as déjà transformé ce message.', flags: MessageFlags.Ephemeral });
           else await interaction.editReply({ content: 'Déjà transformé.', flags: MessageFlags.Ephemeral });
           return;
@@ -728,7 +747,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (sourceMessage.reference?.messageId) { try { const ref = await sourceMessage.fetchReference(); originalQuestion = ref?.content || ''; } catch(e){ console.error('fetchReference', e);} }
       const answerContentRaw = sourceMessage.content;
       const threadName = await generateThreadTitle({ question: originalQuestion || answerContentRaw, answer: answerContentRaw });
-      let thread; try { thread = await parentChannel.threads.create({ name: threadName, autoArchiveDuration: ThreadAutoArchiveDuration.OneDay, reason: 'Thread IA' }); } catch(e){ console.error('create thread', e); if(!interaction.replied) await interaction.editReply('Erreur création thread'); return; }
+  let thread; try { thread = await parentChannel.threads.create({ name: threadName, autoArchiveDuration: THREAD_AUTO_ARCHIVE_DURATION, reason: 'Thread IA' }); } catch(e){ console.error('create thread', e); if(!interaction.replied) await interaction.editReply('Erreur création thread'); return; }
       const owner = interaction.user;
   try { console.log(`[thread] transform user=${owner.tag} (${owner.id}) sourceMsg=${sourceMessage.id} -> thread=${thread?.id || '??'} name="${threadName}"`); } catch {}
       const embed = new EmbedBuilder()
@@ -742,10 +761,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         .setTimestamp(new Date());
       try { await thread.send({ embeds: [embed], components: [buildThreadControlButtons({locked:false})] }); } catch(e){ console.error('send embed', e);}    
       try { await ensureDb(); if (originalQuestion) await addMessage(thread.id,'user',originalQuestion); await addMessage(thread.id,'assistant',answerContentRaw); await setThreadOwner(thread.id, owner.id); await recordTransform(sourceMessage.id, owner.id, thread.id); } catch(e){ console.error('seed meta', e);}    
+  // L'auto-archivage est désormais géré par la durée Discord (THREAD_AUTO_ARCHIVE_DURATION)
       if (!interaction.replied) {
         await interaction.editReply({ content: `Thread créé: <#${thread.id}>` });
       } else {
-  try { await interaction.followUp({ content: `Thread créé: <#${thread.id}>`, flags: MessageFlags.Ephemeral }); } catch {}
+        try { await interaction.followUp({ content: `Thread créé: <#${thread.id}>`, flags: MessageFlags.Ephemeral }); } catch {}
       }
       return;
     }
