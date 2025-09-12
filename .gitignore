@@ -1,0 +1,25 @@
+# Node
+node_modules/
+package-lock.json
+npm-debug.log*
+yarn.lock
+.pnpm-debug.log*
+
+# Env
+.env
+.env.local
+
+# SQLite
+*.db
+*.db-journal
+
+# Logs
+logs/
+*.log
+
+# Editor
+.vscode/
+.DS_Store
+
+# JSON
+blacklist.json

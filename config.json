@@ -1,0 +1,11 @@
+{
+  "guildId": "955492590772449381",
+  "whitelistChannelIds": [],
+  "whitelistAdminUserIds": [],
+  "whitelistAdminRoleIds": [
+    "1416023614834085918"
+  ],
+  "enableThreadTransform": false,
+  "enablePromptCommand": true,
+  "systemPrompt": "Agit comme un enfant de 2 ans"
+}

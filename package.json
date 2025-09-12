@@ -1,0 +1,20 @@
+{
+  "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "discord.js": "^14.22.1",
+    "dotenv": "^17.2.2",
+    "sqlite3": "^5.1.7"
+  },
+  "name": "simple-gemini-discord-bot",
+  "version": "1.0.0",
+  "description": "Bot Discord (2025) utilisant Google Gemini + mémoire de conversation par thread via SQLite.",
+  "main": "index.js",
+  "type": "module",
+  "devDependencies": {},
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "author": "Filouz",
+  "license": "MIT"
+}
