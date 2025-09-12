@@ -1,8 +1,8 @@
 {
-  "guildId": "955492590772449381",
+  "guildId": "",
   "whitelistChannelIds": [],
-  "whitelistAdminUserIds": ["317718119965523980"],
-  "whitelistAdminRoleIds": ["1416023614834085918"],
+  "whitelistAdminUserIds": [],
+  "whitelistAdminRoleIds": [],
   "enableThreadTransform": true,
   "transformThreadCooldownSeconds": 500,
   "transformThreadMaxMessageAgeMinutes": 60,
