@@ -63,20 +63,22 @@ let TRANSFORM_THREAD_MAX_MESSAGE_AGE_MS = (
 // Durée d'auto-archivage configurable (Discord supporte: 60, 1440, 4320, 10080 minutes => 1h, 24h, 3d, 7d)
 // Valeurs admises dans config: "1h", "24h", "3d", "1w" (week=7d)
 let THREAD_AUTO_ARCHIVE_DURATION = ThreadAutoArchiveDuration.OneDay;
-try {
-  const mapDur = {
-    '1h': ThreadAutoArchiveDuration.OneHour,
-    '24h': ThreadAutoArchiveDuration.OneDay,
-    '3d': ThreadAutoArchiveDuration.ThreeDays,
-    '1w': ThreadAutoArchiveDuration.OneWeek
-  };
-  if (typeof CONFIG.threadAutoArchiveDuration === 'string') {
-    const key = CONFIG.threadAutoArchiveDuration.trim().toLowerCase();
-    if (mapDur[key] !== undefined) {
-      THREAD_AUTO_ARCHIVE_DURATION = mapDur[key];
-    }
+const THREAD_AUTO_ARCHIVE_MAP = {
+  '1h': ThreadAutoArchiveDuration.OneHour,
+  '24h': ThreadAutoArchiveDuration.OneDay,
+  '3d': ThreadAutoArchiveDuration.ThreeDays,
+  '1w': ThreadAutoArchiveDuration.OneWeek
+};
+function setThreadAutoArchiveFromKey(key) {
+  const k = String(key || '').trim().toLowerCase();
+  if (THREAD_AUTO_ARCHIVE_MAP[k] !== undefined) {
+    THREAD_AUTO_ARCHIVE_DURATION = THREAD_AUTO_ARCHIVE_MAP[k];
+    CONFIG.threadAutoArchiveDuration = k; // persiste dans config lors de saveConfig
+    return true;
   }
-} catch (e) { console.warn('threadAutoArchiveDuration invalide, utilisation défaut 24h'); }
+  return false;
+}
+try { setThreadAutoArchiveFromKey(CONFIG.threadAutoArchiveDuration || '24h'); } catch (e) { console.warn('threadAutoArchiveDuration invalide, utilisation défaut 24h'); }
 
 function isChannelAllowed(channel) {
   if (!WHITELIST.length) return true; // pas de restriction
@@ -152,7 +154,17 @@ async function registerSlashCommands() {
     .setName('options')
     .setDescription('Met à jour des options IA (admin)')
     .addBooleanOption(o => o.setName('enablethreadtransform').setDescription('Activer le bouton Transformer en thread'))
-    .addIntegerOption(o => o.setName('transformthreadcooldownseconds').setDescription('Cooldown global utilisateur (secondes, 0=off, >=0)').setMinValue(0).setMaxValue(86400));
+    .addIntegerOption(o => o.setName('transformthreadcooldownseconds').setDescription('Cooldown global utilisateur (secondes, 0=off, >=0)').setMinValue(0).setMaxValue(86400))
+    .addStringOption(o => o
+      .setName('threadautoarchiveduration')
+      .setDescription('Durée auto-archivage threads (1h,24h,3d,1w)')
+      .addChoices(
+        { name: '1h', value: '1h' },
+        { name: '24h', value: '24h' },
+        { name: '3d', value: '3d' },
+        { name: '1w', value: '1w' }
+      )
+    );
   commands.push(optionsCmd);
   // Commande /op pour gérer les admins utilisateurs
   const opCmd = new SlashCommandBuilder()
@@ -615,9 +627,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
         const newEnable = interaction.options.getBoolean('enablethreadtransform');
         const newCooldown = interaction.options.getInteger('transformthreadcooldownseconds');
-        if (newEnable === null && newCooldown === null) {
+        const newArchive = interaction.options.getString('threadautoarchiveduration');
+        if (newEnable === null && newCooldown === null && !newArchive) {
           const currentCd = Math.round(TRANSFORM_THREAD_COOLDOWN_MS/1000);
-          await interaction.reply({ content: `Valeurs actuelles:\n- enableThreadTransform: ${ENABLE_THREAD_TRANSFORM}\n- transformThreadCooldownSeconds: ${currentCd}`, flags: MessageFlags.Ephemeral });
+          const currentArchiveKey = CONFIG.threadAutoArchiveDuration || '24h';
+          await interaction.reply({ content: `Valeurs actuelles:\n- enableThreadTransform: ${ENABLE_THREAD_TRANSFORM}\n- transformThreadCooldownSeconds: ${currentCd}\n- threadAutoArchiveDuration: ${currentArchiveKey}`, flags: MessageFlags.Ephemeral });
           return;
         }
         const summary = [];
@@ -631,6 +645,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
             CONFIG.transformThreadCooldownSeconds = safe;
             TRANSFORM_THREAD_COOLDOWN_MS = safe * 1000;
             summary.push(`transformThreadCooldownSeconds => ${safe}`);
+        }
+        if (newArchive) {
+          if (setThreadAutoArchiveFromKey(newArchive)) {
+            summary.push(`threadAutoArchiveDuration => ${newArchive}`);
+          } else {
+            summary.push(`threadAutoArchiveDuration => valeur invalide (${newArchive}) ignorée`);
+          }
         }
         saveConfig();
         await interaction.reply({ content: `Options mises à jour:\n${summary.join('\n')}`, flags: MessageFlags.Ephemeral });
