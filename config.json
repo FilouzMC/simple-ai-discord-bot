@@ -7,8 +7,9 @@
   "whitelistAdminRoleIds": [
     "1416023614834085918"
   ],
-  "enableThreadTransform": false,
+  "enableThreadTransform": true,
   "transformThreadCooldownSeconds": 500,
+  "transformThreadMaxMessageAgeMinutes": 60,
   "enablePromptCommand": true,
   "systemPrompt": "le bot"
 }

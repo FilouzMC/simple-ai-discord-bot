@@ -53,6 +53,12 @@ let TRANSFORM_THREAD_COOLDOWN_MS = (
     ? CONFIG.transformThreadCooldownSeconds
     : 60 // défaut 60s
 ) * 1000;
+// Âge max (en minutes) d'un message bot pouvant être transformé en thread (0 ou valeur <=0 = illimité)
+let TRANSFORM_THREAD_MAX_MESSAGE_AGE_MS = (
+  typeof CONFIG.transformThreadMaxMessageAgeMinutes === 'number' && CONFIG.transformThreadMaxMessageAgeMinutes > 0
+    ? CONFIG.transformThreadMaxMessageAgeMinutes
+    : 30 // défaut 30 minutes
+) * 60 * 1000;
 
 function isChannelAllowed(channel) {
   if (!WHITELIST.length) return true; // pas de restriction
@@ -659,6 +665,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
       const sourceMessage = interaction.message;
       const parentChannel = sourceMessage.channel;
+      // Vérification de l'âge du message (sécurité: transformation seulement messages récents)
+      try {
+        if (TRANSFORM_THREAD_MAX_MESSAGE_AGE_MS > 0) {
+          const ageMs = Date.now() - (sourceMessage.createdTimestamp || 0);
+          if (ageMs > TRANSFORM_THREAD_MAX_MESSAGE_AGE_MS) {
+            if (!interaction.replied && !interaction.deferred) {
+              await interaction.reply({ content: 'Délai expiré: ce message est trop ancien pour être transformé en thread.', flags: MessageFlags.Ephemeral });
+            }
+            return;
+          }
+        }
+      } catch (e) { console.error('age check error', e); }
       await syncThreadLock(parentChannel);
       if (!isChannelAllowed(parentChannel)) {
         try { if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Salon non autorisé.', flags: MessageFlags.Ephemeral }); else if (interaction.deferred) await interaction.editReply({ content: 'Salon non autorisé.', flags: MessageFlags.Ephemeral }); } catch {}
