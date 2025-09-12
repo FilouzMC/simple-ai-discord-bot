@@ -3,7 +3,7 @@
 A Discord bot to chat with **Gemini**, featuring per-thread memory and automatic thread creation.  
 Originally prototyped with **GPT-5** and **VS Code (GitHub Copilot)**.
 
----
+--
 
 ## ✨ Features
 
@@ -34,7 +34,23 @@ npm install
 npm start
 ```
 
----
+### 🐳 Deploy with Docker (easy way)
+
+1. Create a file `.env`
+```
+DISCORD_TOKEN=token
+GEMINI_API_KEY=api_key
+```
+2. Build
+```
+docker build -t simple-gemini-discord-bot .
+```
+3. Run with docker-compose
+```
+docker compose up -d --build
+```
+
+--
 
 ## 📂 Tech Stack
 
@@ -42,7 +58,7 @@ npm start
 - Discord.js
 - SQLite for persistent storage
 
----
+--
 
 ## 📝 Notes
 
