@@ -3,7 +3,7 @@
 A Discord bot to chat with **Gemini**, featuring per-thread memory and automatic thread creation.  
 Originally prototyped with **GPT-5** and **VS Code (GitHub Copilot)**.
 
---
+---
 
 ## ✨ Features
 
@@ -34,7 +34,7 @@ npm install
 npm start
 ```
 
---
+---
 
 ## 📂 Tech Stack
 
@@ -42,7 +42,7 @@ npm start
 - Discord.js
 - SQLite for persistent storage
 
---
+---
 
 ## 📝 Notes
 
