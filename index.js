@@ -483,6 +483,11 @@ client.on(Events.MessageCreate, async (message) => {
 
     await ensureDb();
 
+    // Log début interaction IA
+    try {
+      console.log(`[ai] question user=${message.author.tag} (${message.author.id}) channel=${message.channel.id}${threadId ? ` thread=${threadId}` : ''} len=${content.length}`);
+    } catch {}
+
     let active = true;
     const typingLoop = (async () => {
       while (active) {
@@ -492,6 +497,8 @@ client.on(Events.MessageCreate, async (message) => {
     })();
     const answer = await generateAnswer({ threadId, userQuestion: content });
     active = false; await typingLoop.catch(()=>{});
+
+  try { console.log(`[ai] answer user=${message.author.id} len=${answer.length}`); } catch {}
 
     // Sauvegarde mémoire si thread
     if (threadId) {
@@ -516,6 +523,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
   try {
     // Slash command blacklist
     if (interaction.isChatInputCommand()) {
+  // Log exécution commande (avant permission pour audit)
+  let subName = ''; try { subName = interaction.options.getSubcommand(); } catch {}
+  try { console.log(`[slash] cmd=/${interaction.commandName}${subName?` sub=${subName}`:''} user=${interaction.user.tag} (${interaction.user.id})`); } catch {}
       if (interaction.commandName === 'blacklist') {
   if (!isAdmin(interaction.user.id, interaction.member)) {
           await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
@@ -720,6 +730,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       const threadName = await generateThreadTitle({ question: originalQuestion || answerContentRaw, answer: answerContentRaw });
       let thread; try { thread = await parentChannel.threads.create({ name: threadName, autoArchiveDuration: ThreadAutoArchiveDuration.OneDay, reason: 'Thread IA' }); } catch(e){ console.error('create thread', e); if(!interaction.replied) await interaction.editReply('Erreur création thread'); return; }
       const owner = interaction.user;
+  try { console.log(`[thread] transform user=${owner.tag} (${owner.id}) sourceMsg=${sourceMessage.id} -> thread=${thread?.id || '??'} name="${threadName}"`); } catch {}
       const embed = new EmbedBuilder()
         .setTitle('Conversation IA')
         .setColor(0x5865F2)
