@@ -44,11 +44,11 @@ const WHITELIST = (Array.isArray(CONFIG.whitelistChannelIds) ? CONFIG.whitelistC
   .map(s => String(s).trim())
   .filter(Boolean);
 const CFG_GUILD_ID = CONFIG.guildId || process.env.GUILD_ID;
-const ENABLE_THREAD_TRANSFORM = (typeof CONFIG.enableThreadTransform === 'boolean') ? CONFIG.enableThreadTransform : true;
+let ENABLE_THREAD_TRANSFORM = (typeof CONFIG.enableThreadTransform === 'boolean') ? CONFIG.enableThreadTransform : true;
 // Activation/désactivation de la commande /prompt via config.json { "enablePromptCommand": true/false }
 const ENABLE_PROMPT_COMMAND = (typeof CONFIG.enablePromptCommand === 'boolean') ? CONFIG.enablePromptCommand : true;
 // Cooldown (en secondes) entre deux transformations en thread par le même utilisateur
-const TRANSFORM_THREAD_COOLDOWN_MS = (
+let TRANSFORM_THREAD_COOLDOWN_MS = (
   typeof CONFIG.transformThreadCooldownSeconds === 'number' && CONFIG.transformThreadCooldownSeconds >= 0
     ? CONFIG.transformThreadCooldownSeconds
     : 60 // défaut 60s
@@ -122,6 +122,13 @@ async function registerSlashCommands() {
   } else {
     console.log('[slash] /prompt désactivé par configuration (enablePromptCommand=false)');
   }
+  // Commande options (admin) pour basculer des flags et valeurs numériques
+  const optionsCmd = new SlashCommandBuilder()
+    .setName('options')
+    .setDescription('Met à jour des options IA (admin)')
+    .addBooleanOption(o => o.setName('enablethreadtransform').setDescription('Activer le bouton Transformer en thread'))
+    .addIntegerOption(o => o.setName('transformthreadcooldownseconds').setDescription('Cooldown global utilisateur (secondes, 0=off, >=0)').setMinValue(0).setMaxValue(86400));
+  commands.push(optionsCmd);
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   const scope = CFG_GUILD_ID ? `guild:${CFG_GUILD_ID}` : 'global';
@@ -545,6 +552,34 @@ client.on(Events.InteractionCreate, async (interaction) => {
         CONFIG.systemPrompt = texte;
         saveConfig();
         await interaction.reply({ content: 'Prompt système mis à jour.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (interaction.commandName === 'options') {
+        if (!isAdmin(interaction.user.id, interaction.member)) {
+          await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        const newEnable = interaction.options.getBoolean('enablethreadtransform');
+        const newCooldown = interaction.options.getInteger('transformthreadcooldownseconds');
+        if (newEnable === null && newCooldown === null) {
+          const currentCd = Math.round(TRANSFORM_THREAD_COOLDOWN_MS/1000);
+          await interaction.reply({ content: `Valeurs actuelles:\n- enableThreadTransform: ${ENABLE_THREAD_TRANSFORM}\n- transformThreadCooldownSeconds: ${currentCd}`, flags: MessageFlags.Ephemeral });
+          return;
+        }
+        const summary = [];
+        if (newEnable !== null) {
+          ENABLE_THREAD_TRANSFORM = newEnable;
+          CONFIG.enableThreadTransform = newEnable;
+          summary.push(`enableThreadTransform => ${newEnable}`);
+        }
+        if (typeof newCooldown === 'number') {
+          const safe = Math.max(0, newCooldown);
+            CONFIG.transformThreadCooldownSeconds = safe;
+            TRANSFORM_THREAD_COOLDOWN_MS = safe * 1000;
+            summary.push(`transformThreadCooldownSeconds => ${safe}`);
+        }
+        saveConfig();
+        await interaction.reply({ content: `Options mises à jour:\n${summary.join('\n')}`, flags: MessageFlags.Ephemeral });
         return;
       }
       return; // autre commande ignorée
