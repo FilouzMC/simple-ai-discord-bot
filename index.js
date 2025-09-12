@@ -32,8 +32,8 @@ function saveConfig() {
   } catch (e) { console.error('Erreur saveConfig', e); }
 }
 
-// Admins: uniquement via whitelistAdminUserIds / whitelistAdminRoleIds
-const ADMIN_USER_IDS = (Array.isArray(CONFIG.whitelistAdminUserIds) ? CONFIG.whitelistAdminUserIds : [])
+// Admins: uniquement via whitelistAdminUserIds / whitelistAdminRoleIds (liste mutable pour /op)
+let ADMIN_USER_IDS = (Array.isArray(CONFIG.whitelistAdminUserIds) ? CONFIG.whitelistAdminUserIds : [])
   .map(s => String(s).trim())
   .filter(Boolean);
 const ADMIN_ROLE_IDS = (Array.isArray(CONFIG.whitelistAdminRoleIds) ? CONFIG.whitelistAdminRoleIds : [])
@@ -129,6 +129,14 @@ async function registerSlashCommands() {
     .addBooleanOption(o => o.setName('enablethreadtransform').setDescription('Activer le bouton Transformer en thread'))
     .addIntegerOption(o => o.setName('transformthreadcooldownseconds').setDescription('Cooldown global utilisateur (secondes, 0=off, >=0)').setMinValue(0).setMaxValue(86400));
   commands.push(optionsCmd);
+  // Commande /op pour gérer les admins utilisateurs
+  const opCmd = new SlashCommandBuilder()
+    .setName('op')
+    .setDescription('Gérer la liste des admins utilisateurs')
+    .addSubcommand(sc => sc.setName('add').setDescription('Ajouter un utilisateur admin').addUserOption(o => o.setName('utilisateur').setDescription('Utilisateur').setRequired(true)))
+    .addSubcommand(sc => sc.setName('remove').setDescription('Retirer un utilisateur admin').addUserOption(o => o.setName('utilisateur').setDescription('Utilisateur').setRequired(true)))
+    .addSubcommand(sc => sc.setName('list').setDescription('Lister les utilisateurs admin')); 
+  commands.push(opCmd);
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   const scope = CFG_GUILD_ID ? `guild:${CFG_GUILD_ID}` : 'global';
@@ -581,6 +589,42 @@ client.on(Events.InteractionCreate, async (interaction) => {
         saveConfig();
         await interaction.reply({ content: `Options mises à jour:\n${summary.join('\n')}`, flags: MessageFlags.Ephemeral });
         return;
+      }
+      if (interaction.commandName === 'op') {
+        if (!isAdmin(interaction.user.id, interaction.member)) {
+          await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        const sub = interaction.options.getSubcommand();
+        if (sub === 'add') {
+          const user = interaction.options.getUser('utilisateur', true);
+          const uid = String(user.id);
+          if (ADMIN_USER_IDS.includes(uid)) {
+            await interaction.reply({ content: `${user} est déjà admin.`, flags: MessageFlags.Ephemeral });
+            return;
+          }
+          ADMIN_USER_IDS.push(uid);
+          CONFIG.whitelistAdminUserIds = Array.from(new Set(ADMIN_USER_IDS));
+          saveConfig();
+          await interaction.reply({ content: `${user} ajouté aux admins.`, flags: MessageFlags.Ephemeral });
+          return;
+        } else if (sub === 'remove') {
+          const user = interaction.options.getUser('utilisateur', true);
+            const uid = String(user.id);
+            if (!ADMIN_USER_IDS.includes(uid)) {
+              await interaction.reply({ content: `${user} n'est pas admin.`, flags: MessageFlags.Ephemeral });
+              return;
+            }
+            ADMIN_USER_IDS = ADMIN_USER_IDS.filter(id => id !== uid);
+            CONFIG.whitelistAdminUserIds = ADMIN_USER_IDS;
+            saveConfig();
+            await interaction.reply({ content: `${user} retiré des admins.`, flags: MessageFlags.Ephemeral });
+            return;
+        } else if (sub === 'list') {
+          const list = ADMIN_USER_IDS.length ? ADMIN_USER_IDS.map(id => `<@${id}>`).join(', ') : 'Aucun';
+          await interaction.reply({ content: `Admins utilisateurs (${ADMIN_USER_IDS.length}): ${list}`, flags: MessageFlags.Ephemeral });
+          return;
+        }
       }
       return; // autre commande ignorée
     }
