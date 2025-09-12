@@ -1,12 +1,9 @@
 services:
   bot:
-    build: .
+    image: techcordia:latest
     container_name: gemini-discord-bot
     restart: unless-stopped
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-1.5-pro}
-    volumes:
-      - ./data:/app
-    
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}

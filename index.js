@@ -8,14 +8,26 @@ import fs from 'node:fs';
 // --- Config ---
 const MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-pro';
 const DEFAULT_LOCALE = process.env.DEFAULT_LOCALE || 'fr';
-// Chargement config.json
+// Chargement config depuis ./config/config.json (migration depuis racine si besoin)
+const CONFIG_DIR = path.join(process.cwd(), 'config');
+const CONFIG_FILE_PATH = path.join(CONFIG_DIR, 'config.json');
+try { if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR); } catch {}
+// Migration: si ancien config.json à la racine et pas encore dans config/
+try {
+  const legacy = path.join(process.cwd(), 'config.json');
+  if (fs.existsSync(legacy) && !fs.existsSync(CONFIG_FILE_PATH)) {
+    fs.renameSync(legacy, CONFIG_FILE_PATH);
+    console.log('[migration] config.json déplacé vers config/config.json');
+  }
+} catch (e) { console.warn('Migration config.json impossible', e); }
 let CONFIG = {};
 try {
-  const cfgRaw = fs.readFileSync(path.join(process.cwd(), 'config.json'), 'utf8');
+  const cfgRaw = fs.readFileSync(CONFIG_FILE_PATH, 'utf8');
   CONFIG = JSON.parse(cfgRaw);
 } catch (e) {
-  console.warn('config.json introuvable ou invalide, utilisation des variables d\'env fallback');
+  console.warn('config/config.json introuvable ou invalide, création fichier défaut.');
   CONFIG = {};
+  try { fs.writeFileSync(CONFIG_FILE_PATH, JSON.stringify({}, null, 2), 'utf8'); } catch {}
 }
 
 let SYSTEM_PROMPT = (
@@ -25,7 +37,7 @@ let SYSTEM_PROMPT = (
 ).trim();
 function saveConfig() {
   try {
-    fs.writeFileSync(path.join(process.cwd(), 'config.json'), JSON.stringify({
+    fs.writeFileSync(CONFIG_FILE_PATH, JSON.stringify({
       ...CONFIG,
       systemPrompt: SYSTEM_PROMPT
     }, null, 2), 'utf8');
@@ -89,7 +101,15 @@ function isChannelAllowed(channel) {
 }
 
 // --- Blacklist JSON ---
-const BLACKLIST_PATH = path.join(process.cwd(), 'blacklist.json');
+// Blacklist désormais dans config/blacklist.json (migration depuis racine)
+const BLACKLIST_PATH = path.join(CONFIG_DIR, 'blacklist.json');
+try {
+  const legacyBl = path.join(process.cwd(), 'blacklist.json');
+  if (fs.existsSync(legacyBl) && !fs.existsSync(BLACKLIST_PATH)) {
+    fs.renameSync(legacyBl, BLACKLIST_PATH);
+    console.log('[migration] blacklist.json déplacé vers config/blacklist.json');
+  }
+} catch (e) { console.warn('Migration blacklist.json impossible', e); }
 let blacklistCache = new Set();
 
 function loadBlacklist() {
@@ -198,7 +218,15 @@ async function registerSlashCommands() {
 }
 
 // --- SQLite Setup ---
-const DB_PATH = path.join(process.cwd(), 'memory.db');
+// Base SQLite aussi déplacée dans config/
+const DB_PATH = path.join(CONFIG_DIR, 'memory.db');
+try {
+  const legacyDb = path.join(process.cwd(), 'memory.db');
+  if (fs.existsSync(legacyDb) && !fs.existsSync(DB_PATH)) {
+    fs.renameSync(legacyDb, DB_PATH);
+    console.log('[migration] memory.db déplacé vers config/memory.db');
+  }
+} catch (e) { console.warn('Migration memory.db impossible', e); }
 let db;
 function initDb() {
   return new Promise((resolve, reject) => {
