@@ -47,6 +47,12 @@ const CFG_GUILD_ID = CONFIG.guildId || process.env.GUILD_ID;
 const ENABLE_THREAD_TRANSFORM = (typeof CONFIG.enableThreadTransform === 'boolean') ? CONFIG.enableThreadTransform : true;
 // Activation/désactivation de la commande /prompt via config.json { "enablePromptCommand": true/false }
 const ENABLE_PROMPT_COMMAND = (typeof CONFIG.enablePromptCommand === 'boolean') ? CONFIG.enablePromptCommand : true;
+// Cooldown (en secondes) entre deux transformations en thread par le même utilisateur
+const TRANSFORM_THREAD_COOLDOWN_MS = (
+  typeof CONFIG.transformThreadCooldownSeconds === 'number' && CONFIG.transformThreadCooldownSeconds >= 0
+    ? CONFIG.transformThreadCooldownSeconds
+    : 60 // défaut 60s
+) * 1000;
 
 function isChannelAllowed(channel) {
   if (!WHITELIST.length) return true; // pas de restriction
@@ -226,6 +232,15 @@ function hasUserTransformed(messageId, userId) {
     db.get(`SELECT thread_id FROM thread_transform_log WHERE message_id = ? AND user_id = ?`, [messageId, userId], (err, row) => {
       if (err) return reject(err);
       resolve(!!row);
+    });
+  });
+}
+
+function getLastTransformTs(userId) {
+  return new Promise((resolve, reject) => {
+    db.get(`SELECT ts FROM thread_transform_log WHERE user_id = ? ORDER BY ts DESC LIMIT 1`, [userId], (err, row) => {
+      if (err) return reject(err);
+      resolve(row ? row.ts : null);
     });
   });
 }
@@ -558,7 +573,34 @@ client.on(Events.InteractionCreate, async (interaction) => {
         try { if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Salon non autorisé.', flags: MessageFlags.Ephemeral }); else if (interaction.deferred) await interaction.editReply({ content: 'Salon non autorisé.', flags: MessageFlags.Ephemeral }); } catch {}
         return;
       }
-      try { await ensureDb(); if (await hasUserTransformed(sourceMessage.id, interaction.user.id)) { if(!interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Tu as déjà transformé ce message.', flags: MessageFlags.Ephemeral }); else await interaction.editReply({ content: 'Déjà transformé.', flags: MessageFlags.Ephemeral }); return; } } catch(e){ console.error('check transform', e); }
+      try {
+        await ensureDb();
+        // Vérification cooldown global par utilisateur
+        if (TRANSFORM_THREAD_COOLDOWN_MS > 0) {
+          try {
+            const lastTs = await getLastTransformTs(interaction.user.id);
+            if (lastTs) {
+              const elapsed = Date.now() - lastTs;
+              const remain = TRANSFORM_THREAD_COOLDOWN_MS - elapsed;
+              if (remain > 0) {
+                const secs = Math.ceil(remain / 1000);
+                if (!interaction.replied && !interaction.deferred) {
+                  await interaction.reply({ content: `Cooldown actif. Réessaie dans ${secs}s.`, flags: MessageFlags.Ephemeral });
+                } else if (!interaction.replied) {
+                  await interaction.editReply({ content: `Cooldown actif (${secs}s restants).`, flags: MessageFlags.Ephemeral });
+                }
+                return; // stop
+              }
+            }
+          } catch (e) { console.error('cooldown check error', e); }
+        }
+        // Vérification unique par message
+        if (await hasUserTransformed(sourceMessage.id, interaction.user.id)) {
+          if(!interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Tu as déjà transformé ce message.', flags: MessageFlags.Ephemeral });
+          else await interaction.editReply({ content: 'Déjà transformé.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+      } catch(e){ console.error('check transform', e); }
   // On différé directement en éphémère pour que le message final soit privé
   try { if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ flags: MessageFlags.Ephemeral }); } catch {}
       if (!parentChannel.isTextBased()) { if (!interaction.replied) await interaction.editReply('Impossible ici'); return; }
