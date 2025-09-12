@@ -10,5 +10,5 @@
   "enableThreadTransform": false,
   "transformThreadCooldownSeconds": 500,
   "enablePromptCommand": true,
-  "systemPrompt": "Agit comme un enfant de 2 ans"
+  "systemPrompt": "le bot"
 }

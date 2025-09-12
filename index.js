@@ -116,8 +116,9 @@ async function registerSlashCommands() {
   if (ENABLE_PROMPT_COMMAND) {
     const promptCmd = new SlashCommandBuilder()
       .setName('prompt')
-      .setDescription('Met à jour le system prompt de l\'IA')
-      .addStringOption(o => o.setName('texte').setDescription('Nouveau prompt système').setRequired(true).setMaxLength(1800));
+      .setDescription('Gérer le system prompt')
+      .addSubcommand(sc => sc.setName('show').setDescription('Afficher le prompt système actuel'))
+      .addSubcommand(sc => sc.setName('set').setDescription('Définir un nouveau prompt système').addStringOption(o => o.setName('texte').setDescription('Nouveau prompt système').setRequired(true).setMaxLength(1800)));
     commands.push(promptCmd);
   } else {
     console.log('[slash] /prompt désactivé par configuration (enablePromptCommand=false)');
@@ -551,15 +552,26 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
           return;
         }
-        const texte = interaction.options.getString('texte', true).trim();
-        if (!texte) {
-          await interaction.reply({ content: 'Prompt vide.', flags: MessageFlags.Ephemeral });
+        let sub;
+        try { sub = interaction.options.getSubcommand(); } catch {}
+        if (sub === 'show') {
+          const display = SYSTEM_PROMPT.length > 1800 ? SYSTEM_PROMPT.slice(0, 1800) + '…' : SYSTEM_PROMPT;
+          await interaction.reply({ content: `Prompt actuel (${SYSTEM_PROMPT.length} chars):\n${display}`, flags: MessageFlags.Ephemeral });
           return;
         }
-        SYSTEM_PROMPT = texte;
-        CONFIG.systemPrompt = texte;
-        saveConfig();
-        await interaction.reply({ content: 'Prompt système mis à jour.', flags: MessageFlags.Ephemeral });
+        if (sub === 'set') {
+          const texte = interaction.options.getString('texte', true).trim();
+          if (!texte) {
+            await interaction.reply({ content: 'Prompt vide.', flags: MessageFlags.Ephemeral });
+            return;
+          }
+          SYSTEM_PROMPT = texte;
+          CONFIG.systemPrompt = texte;
+          saveConfig();
+          await interaction.reply({ content: 'Prompt système mis à jour.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        await interaction.reply({ content: 'Sous-commande inconnue.', flags: MessageFlags.Ephemeral });
         return;
       }
       if (interaction.commandName === 'options') {
