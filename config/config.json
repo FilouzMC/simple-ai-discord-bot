@@ -8,5 +8,6 @@
   "transformThreadMaxMessageAgeMinutes": 30,
   "enablePromptCommand": true,
   "systemPrompt": "",
-  "threadAutoArchiveDuration": "24h"
+  "threadAutoArchiveDuration": "24h",
+  "maxAnswerCharsPerMessage": 4000
 }

@@ -31,7 +31,8 @@ const DEFAULT_CONFIG = {
   transformThreadMaxMessageAgeMinutes: 30,
   enablePromptCommand: true,
   systemPrompt: '',
-  threadAutoArchiveDuration: '24h'
+  threadAutoArchiveDuration: '24h',
+  maxAnswerCharsPerMessage: 4000
 };
 let configNeedsWrite = false;
 try {
@@ -111,6 +112,20 @@ function setThreadAutoArchiveFromKey(key) {
   return false;
 }
 try { setThreadAutoArchiveFromKey(CONFIG.threadAutoArchiveDuration || '24h'); } catch (e) { console.warn('threadAutoArchiveDuration invalide, utilisation défaut 24h'); }
+
+// Limite configurable pour tronquer/splitter les réponses IA en plusieurs messages
+// Discord limite à 4000 chars dans un embed description (et 6000 total). On autorise 500-4000.
+let MAX_ANSWER_CHARS = 4000;
+try {
+  const rawLimit = CONFIG.maxAnswerCharsPerMessage;
+  if (typeof rawLimit === 'number') {
+    const clamped = Math.max(500, Math.min(4000, rawLimit));
+    MAX_ANSWER_CHARS = clamped;
+    if (clamped !== rawLimit) { CONFIG.maxAnswerCharsPerMessage = clamped; saveConfig(); }
+  } else {
+    CONFIG.maxAnswerCharsPerMessage = MAX_ANSWER_CHARS; saveConfig();
+  }
+} catch(e) { console.warn('maxAnswerCharsPerMessage invalide, usage défaut 4000'); }
 
 function isChannelAllowed(channel) {
   if (!WHITELIST.length) return true; // pas de restriction
@@ -195,6 +210,7 @@ async function registerSlashCommands() {
     .setDescription('Met à jour des options IA (admin)')
     .addBooleanOption(o => o.setName('enablethreadtransform').setDescription('Activer le bouton Transformer en thread'))
     .addIntegerOption(o => o.setName('transformthreadcooldownseconds').setDescription('Cooldown global utilisateur (secondes, 0=off, >=0)').setMinValue(0).setMaxValue(86400))
+  .addIntegerOption(o => o.setName('maxanswerchars').setDescription('Taille max par message IA (500-4000)').setMinValue(500).setMaxValue(4000))
     .addStringOption(o => o
       .setName('threadautoarchiveduration')
       .setDescription('Durée auto-archivage threads (1h,24h,3d,1w)')
@@ -586,7 +602,44 @@ client.on(Events.MessageCreate, async (message) => {
 
   const components = (inThread || !ENABLE_THREAD_TRANSFORM) ? [] : [buildThreadButton()];
     try {
-      await message.reply({ content: answer, components, allowedMentions: { repliedUser: false } });
+      // Découpage si au-delà limite configurée
+      const chunks = [];
+      if (answer.length <= MAX_ANSWER_CHARS) {
+        chunks.push(answer);
+      } else {
+        let remaining = answer;
+        while (remaining.length) {
+          let slice = remaining.slice(0, MAX_ANSWER_CHARS);
+          // Essayons de couper proprement sur une fin de phrase ou saut de ligne si possible
+          if (remaining.length > MAX_ANSWER_CHARS) {
+            const lastBreak = slice.lastIndexOf('\n');
+            const lastDot = slice.lastIndexOf('. ');
+            const candidate = Math.max(lastBreak, lastDot);
+            if (candidate > MAX_ANSWER_CHARS * 0.5) {
+              slice = slice.slice(0, candidate + 1);
+            }
+          }
+          chunks.push(slice);
+          remaining = remaining.slice(slice.length).trimStart();
+        }
+      }
+
+      let firstReplyMessage = null;
+      for (let i = 0; i < chunks.length; i++) {
+        const part = chunks[i];
+        const embed = new EmbedBuilder()
+          .setColor(0x5865F2)
+          .setAuthor({ name: 'Réponse IA' + (chunks.length > 1 ? ` (partie ${i+1}/${chunks.length})` : ''), iconURL: client.user.displayAvatarURL?.() })
+          .setDescription(part)
+          .setFooter({ text: 'Mentionne de nouveau pour continuer' })
+          .setTimestamp(new Date());
+        const comps = (i === 0) ? components : [];
+        if (i === 0) {
+          firstReplyMessage = await message.reply({ embeds: [embed], components: comps, allowedMentions: { repliedUser: false } });
+        } else {
+          await message.channel.send({ embeds: [embed], components: comps, reply: { messageReference: firstReplyMessage.id }, allowedMentions: { repliedUser: false } });
+        }
+      }
     } catch (e) { console.error('Erreur envoi réponse', e); }
 
   } catch (err) {
@@ -676,10 +729,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const newEnable = interaction.options.getBoolean('enablethreadtransform');
         const newCooldown = interaction.options.getInteger('transformthreadcooldownseconds');
         const newArchive = interaction.options.getString('threadautoarchiveduration');
-        if (newEnable === null && newCooldown === null && !newArchive) {
+        const newMaxChars = interaction.options.getInteger('maxanswerchars');
+        if (newEnable === null && newCooldown === null && !newArchive && newMaxChars === null) {
           const currentCd = Math.round(TRANSFORM_THREAD_COOLDOWN_MS/1000);
           const currentArchiveKey = CONFIG.threadAutoArchiveDuration || '24h';
-          await interaction.reply({ content: `Valeurs actuelles:\n- enableThreadTransform: ${ENABLE_THREAD_TRANSFORM}\n- transformThreadCooldownSeconds: ${currentCd}\n- threadAutoArchiveDuration: ${currentArchiveKey}`, flags: MessageFlags.Ephemeral });
+          await interaction.reply({ content: `Valeurs actuelles:\n- enableThreadTransform: ${ENABLE_THREAD_TRANSFORM}\n- transformThreadCooldownSeconds: ${currentCd}\n- threadAutoArchiveDuration: ${currentArchiveKey}\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}`, flags: MessageFlags.Ephemeral });
           return;
         }
         const summary = [];
@@ -700,6 +754,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
           } else {
             summary.push(`threadAutoArchiveDuration => valeur invalide (${newArchive}) ignorée`);
           }
+        }
+        if (typeof newMaxChars === 'number') {
+          const clamped = Math.max(500, Math.min(4000, newMaxChars));
+          MAX_ANSWER_CHARS = clamped;
+          CONFIG.maxAnswerCharsPerMessage = clamped;
+          summary.push(`maxAnswerCharsPerMessage => ${clamped}` + (clamped !== newMaxChars ? ' (ajusté)' : ''));
         }
         saveConfig();
         await interaction.reply({ content: `Options mises à jour:\n${summary.join('\n')}`, flags: MessageFlags.Ephemeral });
@@ -814,7 +874,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (parentChannel.isThread?.()) { if (!interaction.replied) await interaction.editReply('Déjà un thread.'); return; }
       let originalQuestion = '';
       if (sourceMessage.reference?.messageId) { try { const ref = await sourceMessage.fetchReference(); originalQuestion = ref?.content || ''; } catch(e){ console.error('fetchReference', e);} }
-      const answerContentRaw = sourceMessage.content;
+      // La réponse peut être dans le contenu (ancienne version) ou dans un embed (nouveau mode)
+      let answerContentRaw = sourceMessage.content || '';
+      if (!answerContentRaw && Array.isArray(sourceMessage.embeds) && sourceMessage.embeds.length) {
+        const first = sourceMessage.embeds[0];
+        // On privilégie description
+        if (first?.description) answerContentRaw = first.description;
+        else if (first?.fields?.length) {
+          const fieldRep = first.fields.find(f => /réponse/i.test(f.name || ''));
+          if (fieldRep?.value) answerContentRaw = fieldRep.value;
+        }
+      }
       const threadName = await generateThreadTitle({ question: originalQuestion || answerContentRaw, answer: answerContentRaw });
   let thread; try { thread = await parentChannel.threads.create({ name: threadName, autoArchiveDuration: THREAD_AUTO_ARCHIVE_DURATION, reason: 'Thread IA' }); } catch(e){ console.error('create thread', e); if(!interaction.replied) await interaction.editReply('Erreur création thread'); return; }
       const owner = interaction.user;
