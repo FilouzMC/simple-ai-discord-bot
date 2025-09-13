@@ -21,13 +21,33 @@ try {
   }
 } catch (e) { console.warn('Migration config.json impossible', e); }
 let CONFIG = {};
+const DEFAULT_CONFIG = {
+  guildId: '',
+  whitelistChannelIds: [],
+  whitelistAdminUserIds: [],
+  whitelistAdminRoleIds: [],
+  enableThreadTransform: true,
+  transformThreadCooldownSeconds: 60,
+  transformThreadMaxMessageAgeMinutes: 30,
+  enablePromptCommand: true,
+  systemPrompt: '',
+  threadAutoArchiveDuration: '24h'
+};
+let configNeedsWrite = false;
 try {
   const cfgRaw = fs.readFileSync(CONFIG_FILE_PATH, 'utf8');
   CONFIG = JSON.parse(cfgRaw);
+  // Compléter les clés manquantes
+  for (const k of Object.keys(DEFAULT_CONFIG)) {
+    if (CONFIG[k] === undefined) { CONFIG[k] = DEFAULT_CONFIG[k]; configNeedsWrite = true; }
+  }
 } catch (e) {
-  console.warn('config/config.json introuvable ou invalide, création fichier défaut.');
-  CONFIG = {};
-  try { fs.writeFileSync(CONFIG_FILE_PATH, JSON.stringify({}, null, 2), 'utf8'); } catch {}
+  console.warn('[config] config/config.json introuvable ou invalide, création fichier défaut.');
+  CONFIG = { ...DEFAULT_CONFIG };
+  configNeedsWrite = true;
+}
+if (configNeedsWrite) {
+  try { fs.writeFileSync(CONFIG_FILE_PATH, JSON.stringify(CONFIG, null, 2), 'utf8'); console.log('[config] Fichier généré/mis à jour.'); } catch (e) { console.error('Impossible d\'écrire config par défaut', e); }
 }
 
 let SYSTEM_PROMPT = (
@@ -476,7 +496,7 @@ function isBotMentioned(message) {
 }
 
 client.once(Events.ClientReady, () => {
-  console.log(`Connecté en tant que ${client.user.tag}`);
+  console.log(`[bot] Connecté en tant que ${client.user.tag}`);
   loadBlacklist();
   registerSlashCommands();
 });

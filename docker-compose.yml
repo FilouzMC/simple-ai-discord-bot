@@ -1,7 +1,7 @@
 services:
   bot:
-    image: techcordia:latest
-    container_name: gemini-discord-bot
+    image: simple-gemini-discord-bot:latest
+    container_name: simple-gemini-discord-bot
     restart: unless-stopped
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}

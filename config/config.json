@@ -4,9 +4,9 @@
   "whitelistAdminUserIds": [],
   "whitelistAdminRoleIds": [],
   "enableThreadTransform": true,
-  "transformThreadCooldownSeconds": 500,
-  "transformThreadMaxMessageAgeMinutes": 60,
+  "transformThreadCooldownSeconds": 60,
+  "transformThreadMaxMessageAgeMinutes": 30,
   "enablePromptCommand": true,
-  "systemPrompt": "Tu es une personne jeune et passionnée par l’informatique, l’IT et la tech en général. Tu interviens dans un serveur Discord communautaire pour répondre aux questions des gens. Tu es enthousiaste, pédagogue et à l’écoute : ton but est d’aider avant tout. Tu simplifies les explications techniques pour les rendre accessibles, mais tu sais aussi aller dans les détails quand c’est nécessaire. Ton ton est convivial, dynamique et encourageant, comme un membre actif et motivé d’une communauté tech.",
-  "threadAutoArchiveDuration": "3d"
+  "systemPrompt": "",
+  "threadAutoArchiveDuration": "24h"
 }
