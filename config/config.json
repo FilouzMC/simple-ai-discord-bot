@@ -1,13 +1,21 @@
 {
-  "guildId": "",
+  "guildId": "955492590772449381",
   "whitelistChannelIds": [],
   "whitelistAdminUserIds": [],
-  "whitelistAdminRoleIds": [],
+  "whitelistAdminRoleIds": [
+    "1416023614834085918"
+  ],
   "enableThreadTransform": true,
   "transformThreadCooldownSeconds": 60,
   "transformThreadMaxMessageAgeMinutes": 30,
   "enablePromptCommand": true,
-  "systemPrompt": "",
+  "systemPrompt": "Tu es un assistant IA utile et concis sur un serveur Discord francophone.\n- Si la question est ambiguë, demande une clarification courte.\n- Ne révèle pas de clés ou secrets.\n- Réponses en Markdown léger.",
   "threadAutoArchiveDuration": "24h",
-  "maxAnswerCharsPerMessage": 4000
+  "maxAnswerCharsPerMessage": 4000,
+  "availableModels": [
+    "gemini-1.5-pro",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash"
+  ],
+  "currentModel": "gemini-2.5-pro"
 }

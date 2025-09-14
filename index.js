@@ -6,7 +6,8 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 // --- Config ---
-const MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-pro';
+// Fallback modèle si config vide (ensuite géré via config.json)
+const ENV_FALLBACK_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-pro';
 const DEFAULT_LOCALE = process.env.DEFAULT_LOCALE || 'fr';
 // Chargement config depuis ./config/config.json (migration depuis racine si besoin)
 const CONFIG_DIR = path.join(process.cwd(), 'config');
@@ -32,7 +33,9 @@ const DEFAULT_CONFIG = {
   enablePromptCommand: true,
   systemPrompt: '',
   threadAutoArchiveDuration: '24h',
-  maxAnswerCharsPerMessage: 4000
+  maxAnswerCharsPerMessage: 4000,
+  availableModels: ['gemini-1.5-pro','gemini-1.5-flash'],
+  currentModel: 'gemini-1.5-pro'
 };
 let configNeedsWrite = false;
 try {
@@ -49,6 +52,26 @@ try {
 }
 if (configNeedsWrite) {
   try { fs.writeFileSync(CONFIG_FILE_PATH, JSON.stringify(CONFIG, null, 2), 'utf8'); console.log('[config] Fichier généré/mis à jour.'); } catch (e) { console.error('Impossible d\'écrire config par défaut', e); }
+}
+
+// --- Initialisation modèles IA ---
+let AVAILABLE_MODELS = Array.isArray(CONFIG.availableModels) ? CONFIG.availableModels.filter(m => typeof m === 'string' && m.trim()).map(m=>m.trim()) : [];
+if (!AVAILABLE_MODELS.length) AVAILABLE_MODELS = [ENV_FALLBACK_MODEL];
+if (!AVAILABLE_MODELS.includes(ENV_FALLBACK_MODEL)) AVAILABLE_MODELS.unshift(ENV_FALLBACK_MODEL);
+AVAILABLE_MODELS = Array.from(new Set(AVAILABLE_MODELS)).slice(0,25);
+CONFIG.availableModels = AVAILABLE_MODELS;
+let CURRENT_MODEL = (CONFIG.currentModel && AVAILABLE_MODELS.includes(CONFIG.currentModel)) ? CONFIG.currentModel : AVAILABLE_MODELS[0];
+CONFIG.currentModel = CURRENT_MODEL;
+
+function setCurrentModel(name) {
+  if (AVAILABLE_MODELS.includes(name)) {
+    CURRENT_MODEL = name;
+    CONFIG.currentModel = name;
+    saveConfig();
+    console.log(`[model] Modèle actuel changé -> ${CURRENT_MODEL}`);
+    return true;
+  }
+  return false;
 }
 
 let SYSTEM_PROMPT = (
@@ -211,6 +234,11 @@ async function registerSlashCommands() {
     .addBooleanOption(o => o.setName('enablethreadtransform').setDescription('Activer le bouton Transformer en thread'))
     .addIntegerOption(o => o.setName('transformthreadcooldownseconds').setDescription('Cooldown global utilisateur (secondes, 0=off, >=0)').setMinValue(0).setMaxValue(86400))
   .addIntegerOption(o => o.setName('maxanswerchars').setDescription('Taille max par message IA (500-4000)').setMinValue(500).setMaxValue(4000))
+    .addStringOption(o => {
+      o.setName('model').setDescription('Changer le modèle IA');
+      AVAILABLE_MODELS.forEach(m => o.addChoices({ name: m, value: m }));
+      return o;
+    })
     .addStringOption(o => o
       .setName('threadautoarchiveduration')
       .setDescription('Durée auto-archivage threads (1h,24h,3d,1w)')
@@ -385,7 +413,7 @@ async function generateAnswer({ threadId, userQuestion }) {
     const history = threadId ? await getThreadMemory(threadId) : [];
   const prior = history.map(h => `${h.role.toUpperCase()}: ${h.content}`).join('\n');
   const prompt = [SYSTEM_PROMPT, prior ? prior : '', `UTILISATEUR: ${userQuestion}`, 'ASSISTANT:'].filter(Boolean).join('\n\n');
-    const model = genAI.getGenerativeModel({ model: MODEL });
+  const model = genAI.getGenerativeModel({ model: CURRENT_MODEL });
 
     const result = await withTimeout(model.generateContent(prompt), 25000, 'Délai de génération dépassé');
     const response = result.response.text();
@@ -398,7 +426,7 @@ async function generateAnswer({ threadId, userQuestion }) {
 
 async function generateThreadTitle({ question, answer }) {
   try {
-    const model = genAI.getGenerativeModel({ model: MODEL });
+  const model = genAI.getGenerativeModel({ model: CURRENT_MODEL });
     const prompt = `Génère un titre très court (5-7 mots max) en français, descriptif et neutre pour une discussion sur Discord basée sur la question et la réponse suivantes.\n- Pas d'émojis.\n- Pas de guillemets.\n- Pas de ponctuation finale.\nQuestion: ${question}\nRéponse: ${answer}\nTitre:`;
     const res = await withTimeout(model.generateContent(prompt), 15000, 'Timeout titre');
     let title = res.response.text().split('\n')[0].trim();
@@ -426,7 +454,7 @@ function withTimeout(promise, ms, label = 'Timeout') {
 async function testGemini() {
   try {
     if (!process.env.GEMINI_API_KEY) return { ok: false, error: 'CLE API GEMINI absente' };
-    const model = genAI.getGenerativeModel({ model: MODEL });
+  const model = genAI.getGenerativeModel({ model: CURRENT_MODEL });
     const r = await model.generateContent('ping');
     const text = r.response.text().slice(0, 40);
     return { ok: true, sample: text };
@@ -553,7 +581,7 @@ client.on(Events.MessageCreate, async (message) => {
         `DB: ${dbStatus.ok ? 'OK' : 'ERREUR'}${dbStatus.error ? ` (${dbStatus.error})` : ''}`,
         `Gemini: ${gemStatus.ok ? 'OK' : 'ERREUR'}${gemStatus.error ? ` (${gemStatus.error})` : gemStatus.sample ? ` (extrait: ${gemStatus.sample})` : ''}`,
         `Node: ${process.version}`,
-        `Model: ${MODEL}`
+  `Model: ${CURRENT_MODEL}`
       ].join('\n');
       await message.reply({ content: 'Diagnostic:\n' + details, allowedMentions: { repliedUser: false } });
       return;
@@ -730,10 +758,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const newCooldown = interaction.options.getInteger('transformthreadcooldownseconds');
         const newArchive = interaction.options.getString('threadautoarchiveduration');
         const newMaxChars = interaction.options.getInteger('maxanswerchars');
-        if (newEnable === null && newCooldown === null && !newArchive && newMaxChars === null) {
+        const newModel = interaction.options.getString('model');
+        if (newEnable === null && newCooldown === null && !newArchive && newMaxChars === null && !newModel) {
           const currentCd = Math.round(TRANSFORM_THREAD_COOLDOWN_MS/1000);
           const currentArchiveKey = CONFIG.threadAutoArchiveDuration || '24h';
-          await interaction.reply({ content: `Valeurs actuelles:\n- enableThreadTransform: ${ENABLE_THREAD_TRANSFORM}\n- transformThreadCooldownSeconds: ${currentCd}\n- threadAutoArchiveDuration: ${currentArchiveKey}\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}`, flags: MessageFlags.Ephemeral });
+          await interaction.reply({ content: `Valeurs actuelles:\n- enableThreadTransform: ${ENABLE_THREAD_TRANSFORM}\n- transformThreadCooldownSeconds: ${currentCd}\n- threadAutoArchiveDuration: ${currentArchiveKey}\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}\n- currentModel: ${CURRENT_MODEL}\n- availableModels: ${AVAILABLE_MODELS.join(', ')}`, flags: MessageFlags.Ephemeral });
           return;
         }
         const summary = [];
@@ -760,6 +789,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
           MAX_ANSWER_CHARS = clamped;
           CONFIG.maxAnswerCharsPerMessage = clamped;
           summary.push(`maxAnswerCharsPerMessage => ${clamped}` + (clamped !== newMaxChars ? ' (ajusté)' : ''));
+        }
+        if (newModel) {
+          if (setCurrentModel(newModel)) {
+            summary.push(`model => ${CURRENT_MODEL}`);
+          } else {
+            summary.push(`model => valeur inconnue (${newModel}) ignorée`);
+          }
         }
         saveConfig();
         await interaction.reply({ content: `Options mises à jour:\n${summary.join('\n')}`, flags: MessageFlags.Ephemeral });
