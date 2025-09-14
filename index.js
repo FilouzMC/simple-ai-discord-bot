@@ -659,7 +659,7 @@ client.on(Events.MessageCreate, async (message) => {
           .setColor(0x5865F2)
           .setAuthor({ name: 'Réponse IA' + (chunks.length > 1 ? ` (partie ${i+1}/${chunks.length})` : ''), iconURL: client.user.displayAvatarURL?.() })
           .setDescription(part)
-          .setFooter({ text: 'Mentionne de nouveau pour continuer' })
+          .setFooter({ text: `Modèle: ${CURRENT_MODEL} • Mentionne de nouveau pour continuer` })
           .setTimestamp(new Date());
         const comps = (i === 0) ? components : [];
         if (i === 0) {
