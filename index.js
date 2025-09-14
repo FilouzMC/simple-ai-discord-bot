@@ -34,8 +34,12 @@ const DEFAULT_CONFIG = {
   systemPrompt: '',
   threadAutoArchiveDuration: '24h',
   maxAnswerCharsPerMessage: 4000,
-  availableModels: ['gemini-1.5-pro','gemini-1.5-flash'],
-  currentModel: 'gemini-1.5-pro'
+  availableModels: ['gemini-2.5-pro','gemini-2.5-flash'],
+  currentModel: 'gemini-2.5-pro',
+  enableChannelContext: true,
+  channelContextMessageLimit: 6,
+  debugLogPrompts: false
+  ,channelContextMaxOverride: 20
 };
 let configNeedsWrite = false;
 try {
@@ -150,6 +154,35 @@ try {
   }
 } catch(e) { console.warn('maxAnswerCharsPerMessage invalide, usage défaut 4000'); }
 
+// Contexte canal (hors thread) : inclusion des derniers messages récents non-bot
+let ENABLE_CHANNEL_CONTEXT = typeof CONFIG.enableChannelContext === 'boolean' ? CONFIG.enableChannelContext : true;
+let CHANNEL_CONTEXT_LIMIT = (typeof CONFIG.channelContextMessageLimit === 'number' && CONFIG.channelContextMessageLimit > 0) ? Math.min(25, CONFIG.channelContextMessageLimit) : 6;
+if (CHANNEL_CONTEXT_LIMIT !== CONFIG.channelContextMessageLimit) { CONFIG.channelContextMessageLimit = CHANNEL_CONTEXT_LIMIT; saveConfig(); }
+
+// Debug prompts (journalisation complète du prompt envoyé à l'API)
+let DEBUG_LOG_PROMPTS = !!CONFIG.debugLogPrompts;
+let CHANNEL_CONTEXT_MAX_OVERRIDE = (typeof CONFIG.channelContextMaxOverride === 'number' && CONFIG.channelContextMaxOverride > 0) ? Math.min(50, CONFIG.channelContextMaxOverride) : 20;
+if (CHANNEL_CONTEXT_MAX_OVERRIDE !== CONFIG.channelContextMaxOverride) { CONFIG.channelContextMaxOverride = CHANNEL_CONTEXT_MAX_OVERRIDE; saveConfig(); }
+
+async function buildChannelContext(channel, uptoMessageId, overrideLimit) {
+  if (!ENABLE_CHANNEL_CONTEXT) return '';
+  if (!channel?.isTextBased?.()) return '';
+  try {
+  const effLimit = overrideLimit && overrideLimit > 0 ? Math.min(CHANNEL_CONTEXT_MAX_OVERRIDE, overrideLimit) : CHANNEL_CONTEXT_LIMIT;
+  const fetched = await channel.messages.fetch({ limit: effLimit + 5 }); // un peu plus pour filtrer bots
+    // Trier chronologiquement
+    const msgs = Array.from(fetched.values())
+      .filter(m => !m.author.bot && m.id !== uptoMessageId)
+      .sort((a,b)=>a.createdTimestamp - b.createdTimestamp)
+  .slice(-effLimit);
+    if (!msgs.length) return '';
+    const lines = msgs.map(m => `${m.author.username}: ${m.content.replace(/\n+/g,' ').slice(0,300)}`);
+    return `Contexte récent du salon (dernier${lines.length>1?'s':''} messages):\n"""\n${lines.join('\n')}\n"""\n`;
+  } catch (e) {
+    return '';
+  }
+}
+
 function isChannelAllowed(channel) {
   if (!WHITELIST.length) return true; // pas de restriction
   if (channel.isThread?.()) {
@@ -239,6 +272,10 @@ async function registerSlashCommands() {
       AVAILABLE_MODELS.forEach(m => o.addChoices({ name: m, value: m }));
       return o;
     })
+  .addBooleanOption(o => o.setName('enablechannelcontext').setDescription('Activer le contexte récent du salon (hors thread)'))
+  .addIntegerOption(o => o.setName('channelcontextlimit').setDescription('Nb messages récents salon (1-25)').setMinValue(1).setMaxValue(25))
+  .addIntegerOption(o => o.setName('channelcontextmaxoverride').setDescription('Limite max override utilisateur (1-50)').setMinValue(1).setMaxValue(50))
+  .addBooleanOption(o => o.setName('debuglogprompts').setDescription('Activer log complet des prompts (attention aux données sensibles)'))
     .addStringOption(o => o
       .setName('threadautoarchiveduration')
       .setDescription('Durée auto-archivage threads (1h,24h,3d,1w)')
@@ -425,15 +462,27 @@ async function syncThreadLock(thread) {
 // --- Gemini Setup ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
-async function generateAnswer({ threadId, userQuestion }) {
+async function generateAnswer({ threadId, userQuestion, channelContext }) {
   try {
     const history = threadId ? await getThreadMemory(threadId) : [];
   const prior = history.map(h => `${h.role.toUpperCase()}: ${h.content}`).join('\n');
-  const prompt = [SYSTEM_PROMPT, prior ? prior : '', `UTILISATEUR: ${userQuestion}`, 'ASSISTANT:'].filter(Boolean).join('\n\n');
+  const parts = [SYSTEM_PROMPT];
+  if (channelContext) parts.push(channelContext.trim());
+  if (prior) parts.push(prior);
+  parts.push(`UTILISATEUR: ${userQuestion}`, 'ASSISTANT:');
+  const prompt = parts.filter(Boolean).join('\n\n');
   const model = genAI.getGenerativeModel({ model: CURRENT_MODEL });
+  if (DEBUG_LOG_PROMPTS) {
+    try {
+      console.log(`[debug][prompt] model=${CURRENT_MODEL} length=${prompt.length}\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
+    } catch {}
+  }
 
     const result = await withTimeout(model.generateContent(prompt), 25000, 'Délai de génération dépassé');
     const response = result.response.text();
+    if (DEBUG_LOG_PROMPTS) {
+      try { console.log(`[debug][response] length=${(response||'').length}\n----- RESPONSE START -----\n${response}\n----- RESPONSE END -----`); } catch {}
+    }
     return (response || '').trim() || 'Réponse vide reçue.';
   } catch (e) {
     console.error('Erreur generateAnswer', e);
@@ -610,6 +659,19 @@ client.on(Events.MessageCreate, async (message) => {
       const mentionSyntax = new RegExp(`<@!?${botId}>`,'g');
       content = content.replace(mentionSyntax, '').trim();
     }
+    // Extraction éventuelle d'un nombre de surcharge de contexte juste après mention
+    let overrideContextCount = null;
+    if (mentioned) {
+      // Tolérer espaces multiples puis un nombre
+      const match = content.match(/^(?:\s*)(\d{1,3})\b/);
+      if (match) {
+        const n = parseInt(match[1],10);
+        if (!isNaN(n) && n > 0) {
+          overrideContextCount = Math.min(CHANNEL_CONTEXT_MAX_OVERRIDE, n);
+          content = content.slice(match[0].length).trimStart();
+        }
+      }
+    }
     // Si on répond à quelqu'un d'autre que le bot, injecter le message cité comme contexte
     if (referencedMessage && referencedMessage.author?.id !== botId) {
       const original = (referencedMessage.content || '').trim();
@@ -618,13 +680,19 @@ client.on(Events.MessageCreate, async (message) => {
         content = `Contexte du message cité:\n"""${original}"""\nQuestion: ${content}`;
       }
     }
-    if (!content) return; // Rien à répondre
+    if (!content) {
+      if (overrideContextCount) {
+        content = 'Analyse et synthèse du contexte récent, puis prête une réponse utile.';
+      } else {
+        return; // aucun texte ni override => on sort
+      }
+    }
 
     await ensureDb();
 
     // Log début interaction IA
     try {
-      console.log(`[ai] question user=${message.author.tag} (${message.author.id}) channel=${message.channel.id}${threadId ? ` thread=${threadId}` : ''} len=${content.length}`);
+      console.log(`[ai] question user=${message.author.tag} (${message.author.id}) channel=${message.channel.id}${threadId ? ` thread=${threadId}` : ''} len=${content.length}${overrideContextCount?` overrideCtx=${overrideContextCount}`:''}`);
     } catch {}
 
     let active = true;
@@ -634,7 +702,12 @@ client.on(Events.MessageCreate, async (message) => {
         await new Promise(r => setTimeout(r, 7000));
       }
     })();
-    const answer = await generateAnswer({ threadId, userQuestion: content });
+    // Contexte channel (uniquement hors thread)
+    let channelContext = '';
+    if (!threadId) {
+      try { channelContext = await buildChannelContext(message.channel, message.id, overrideContextCount); } catch {}
+    }
+    const answer = await generateAnswer({ threadId, userQuestion: content, channelContext });
     active = false; await typingLoop.catch(()=>{});
 
   try { console.log(`[ai] answer user=${message.author.id} len=${answer.length}`); } catch {}
@@ -776,10 +849,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const newArchive = interaction.options.getString('threadautoarchiveduration');
         const newMaxChars = interaction.options.getInteger('maxanswerchars');
         const newModel = interaction.options.getString('model');
-        if (newEnable === null && newCooldown === null && !newArchive && newMaxChars === null && !newModel) {
+        const newEnableChanCtx = interaction.options.getBoolean('enablechannelcontext');
+        const newChanCtxLimit = interaction.options.getInteger('channelcontextlimit');
+        const newDebugLog = interaction.options.getBoolean('debuglogprompts');
+        const newChanCtxMaxOverride = interaction.options.getInteger('channelcontextmaxoverride');
+        if (newEnable === null && newCooldown === null && !newArchive && newMaxChars === null && !newModel && newEnableChanCtx === null && newChanCtxLimit === null && newDebugLog === null && newChanCtxMaxOverride === null) {
           const currentCd = Math.round(TRANSFORM_THREAD_COOLDOWN_MS/1000);
           const currentArchiveKey = CONFIG.threadAutoArchiveDuration || '24h';
-          await interaction.reply({ content: `Valeurs actuelles:\n- enableThreadTransform: ${ENABLE_THREAD_TRANSFORM}\n- transformThreadCooldownSeconds: ${currentCd}\n- threadAutoArchiveDuration: ${currentArchiveKey}\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}\n- currentModel: ${CURRENT_MODEL}\n- availableModels: ${AVAILABLE_MODELS.join(', ')}`, flags: MessageFlags.Ephemeral });
+          await interaction.reply({ content: `Valeurs actuelles:\n- enableThreadTransform: ${ENABLE_THREAD_TRANSFORM}\n- transformThreadCooldownSeconds: ${currentCd}\n- threadAutoArchiveDuration: ${currentArchiveKey}\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}\n- enableChannelContext: ${ENABLE_CHANNEL_CONTEXT}\n- channelContextMessageLimit: ${CHANNEL_CONTEXT_LIMIT}\n- channelContextMaxOverride: ${CHANNEL_CONTEXT_MAX_OVERRIDE}\n- debugLogPrompts: ${DEBUG_LOG_PROMPTS}\n- currentModel: ${CURRENT_MODEL}\n- availableModels: ${AVAILABLE_MODELS.join(', ')}`, flags: MessageFlags.Ephemeral });
           return;
         }
         const summary = [];
@@ -787,6 +864,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
           ENABLE_THREAD_TRANSFORM = newEnable;
           CONFIG.enableThreadTransform = newEnable;
           summary.push(`enableThreadTransform => ${newEnable}`);
+        }
+        if (newEnableChanCtx !== null) {
+          ENABLE_CHANNEL_CONTEXT = newEnableChanCtx;
+          CONFIG.enableChannelContext = newEnableChanCtx;
+          summary.push(`enableChannelContext => ${newEnableChanCtx}`);
         }
         if (typeof newCooldown === 'number') {
           const safe = Math.max(0, newCooldown);
@@ -807,12 +889,29 @@ client.on(Events.InteractionCreate, async (interaction) => {
           CONFIG.maxAnswerCharsPerMessage = clamped;
           summary.push(`maxAnswerCharsPerMessage => ${clamped}` + (clamped !== newMaxChars ? ' (ajusté)' : ''));
         }
+        if (typeof newChanCtxLimit === 'number') {
+          const safe = Math.max(1, Math.min(25, newChanCtxLimit));
+          CHANNEL_CONTEXT_LIMIT = safe;
+          CONFIG.channelContextMessageLimit = safe;
+          summary.push(`channelContextMessageLimit => ${safe}` + (safe !== newChanCtxLimit ? ' (ajusté)' : ''));
+        }
+        if (typeof newChanCtxMaxOverride === 'number') {
+          const safe = Math.max(1, Math.min(50, newChanCtxMaxOverride));
+          CHANNEL_CONTEXT_MAX_OVERRIDE = safe;
+          CONFIG.channelContextMaxOverride = safe;
+          summary.push(`channelContextMaxOverride => ${safe}` + (safe !== newChanCtxMaxOverride ? ' (ajusté)' : ''));
+        }
         if (newModel) {
           if (setCurrentModel(newModel)) {
             summary.push(`model => ${CURRENT_MODEL}`);
           } else {
             summary.push(`model => valeur inconnue (${newModel}) ignorée`);
           }
+        }
+        if (newDebugLog !== null) {
+          DEBUG_LOG_PROMPTS = newDebugLog;
+          CONFIG.debugLogPrompts = newDebugLog;
+          summary.push(`debugLogPrompts => ${newDebugLog}`);
         }
         saveConfig();
         await interaction.reply({ content: `Options mises à jour:\n${summary.join('\n')}`, flags: MessageFlags.Ephemeral });
