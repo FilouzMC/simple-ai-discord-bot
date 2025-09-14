@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Partials, Events, ActionRowBuilder, ButtonBuilder, ButtonStyle, ThreadAutoArchiveDuration, MessageFlags, EmbedBuilder, PermissionsBitField, REST, Routes, SlashCommandBuilder } from 'discord.js';
+import { Client, GatewayIntentBits, Partials, Events, ActionRowBuilder, ButtonBuilder, ButtonStyle, ThreadAutoArchiveDuration, MessageFlags, EmbedBuilder, PermissionsBitField, REST, Routes, SlashCommandBuilder, ChannelType } from 'discord.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import sqlite3 from 'sqlite3';
 import path from 'node:path';
@@ -96,7 +96,7 @@ const ADMIN_ROLE_IDS = (Array.isArray(CONFIG.whitelistAdminRoleIds) ? CONFIG.whi
   .map(s => String(s).trim())
   .filter(Boolean);
 // Whitelist des salons texte (héritage pour les threads)
-const WHITELIST = (Array.isArray(CONFIG.whitelistChannelIds) ? CONFIG.whitelistChannelIds : (process.env.WHITELIST_CHANNEL_IDS || '').split(','))
+let WHITELIST = (Array.isArray(CONFIG.whitelistChannelIds) ? CONFIG.whitelistChannelIds : (process.env.WHITELIST_CHANNEL_IDS || '').split(','))
   .map(s => String(s).trim())
   .filter(Boolean);
 const CFG_GUILD_ID = CONFIG.guildId || process.env.GUILD_ID;
@@ -258,6 +258,23 @@ async function registerSlashCommands() {
     .addSubcommand(sc => sc.setName('remove').setDescription('Retirer un utilisateur admin').addUserOption(o => o.setName('utilisateur').setDescription('Utilisateur').setRequired(true)))
     .addSubcommand(sc => sc.setName('list').setDescription('Lister les utilisateurs admin')); 
   commands.push(opCmd);
+
+  // Commande whitelistchannels (admin)
+  const wlCmd = new SlashCommandBuilder()
+    .setName('whitelistchannels')
+    .setDescription('Gérer la whitelist des salons IA (admin)')
+    .addSubcommand(sc => sc
+      .setName('add')
+      .setDescription('Ajouter un salon à la whitelist')
+      .addChannelOption(o => o.setName('salon').setDescription('Salon texte').addChannelTypes(ChannelType.GuildText).setRequired(true)))
+    .addSubcommand(sc => sc
+      .setName('remove')
+      .setDescription('Retirer un salon de la whitelist')
+      .addChannelOption(o => o.setName('salon').setDescription('Salon texte').addChannelTypes(ChannelType.GuildText).setRequired(true)))
+    .addSubcommand(sc => sc
+      .setName('list')
+      .setDescription('Lister les salons whitelists'));
+  commands.push(wlCmd);
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   const scope = CFG_GUILD_ID ? `guild:${CFG_GUILD_ID}` : 'global';
@@ -834,6 +851,46 @@ client.on(Events.InteractionCreate, async (interaction) => {
         } else if (sub === 'list') {
           const list = ADMIN_USER_IDS.length ? ADMIN_USER_IDS.map(id => `<@${id}>`).join(', ') : 'Aucun';
           await interaction.reply({ content: `Admins utilisateurs (${ADMIN_USER_IDS.length}): ${list}`, flags: MessageFlags.Ephemeral });
+          return;
+        }
+      }
+      if (interaction.commandName === 'whitelistchannels') {
+        if (!isAdmin(interaction.user.id, interaction.member)) {
+          await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        const sub = interaction.options.getSubcommand();
+        if (sub === 'add') {
+          const ch = interaction.options.getChannel('salon', true);
+          const id = ch.id;
+          if (WHITELIST.includes(id)) {
+            await interaction.reply({ content: `${ch} déjà dans la whitelist.`, flags: MessageFlags.Ephemeral });
+            return;
+          }
+          WHITELIST.push(id);
+          CONFIG.whitelistChannelIds = WHITELIST;
+          saveConfig();
+          await interaction.reply({ content: `${ch} ajouté à la whitelist.`, flags: MessageFlags.Ephemeral });
+          return;
+        } else if (sub === 'remove') {
+          const ch = interaction.options.getChannel('salon', true);
+          const id = ch.id;
+            if (!WHITELIST.includes(id)) {
+              await interaction.reply({ content: `${ch} n'est pas dans la whitelist.`, flags: MessageFlags.Ephemeral });
+              return;
+            }
+            WHITELIST = WHITELIST.filter(c => c !== id);
+            CONFIG.whitelistChannelIds = WHITELIST;
+            saveConfig();
+            await interaction.reply({ content: `${ch} retiré de la whitelist.`, flags: MessageFlags.Ephemeral });
+            return;
+        } else if (sub === 'list') {
+          if (!WHITELIST.length) {
+            await interaction.reply({ content: 'Whitelist vide (tous les salons autorisés).', flags: MessageFlags.Ephemeral });
+            return;
+          }
+          const display = WHITELIST.map(id => `<#${id}>`).join(', ');
+          await interaction.reply({ content: `Salons whitelists (${WHITELIST.length}): ${display}`, flags: MessageFlags.Ephemeral });
           return;
         }
       }
