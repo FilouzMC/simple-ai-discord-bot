@@ -6,21 +6,19 @@
     "1416023614834085918"
   ],
   "enablePromptCommand": true,
-  "systemPrompt": "Une ia sympa",
+  "systemPrompt": "Tu es un assistant IA utile et concis sur un serveur Discord francophone.\n- Si la question est ambiguë, demande une clarification courte.\n- Ne révèle pas de clés ou secrets.\n- Réponses en Markdown léger.",
   "maxAnswerCharsPerMessage": 4000,
   "availableModels": [
-    "gemini-1.5-pro",
     "gemini-2.5-pro",
     "gemini-2.5-flash"
   ],
-  "currentModel": "gemini-2.5-flash",
+  "currentModel": "gemini-2.5-pro",
   "enableChannelContext": true,
-  "channelContextMessageLimit": 10,
-  "debugLogPrompts": true,
+  "channelContextMessageLimit": 6,
+  "debug": true,
   "channelContextMaxOverride": 20,
   "channelContextAutoForgetSeconds": 0,
-  "enableThreadTransform": true,
-  "transformThreadCooldownSeconds": 60,
-  "transformThreadMaxMessageAgeMinutes": 30,
-  "threadAutoArchiveDuration": "24h"
+  "enableAutoResponse": true,
+  "autoResponseMinIntervalSeconds": 180,
+  "autoResponseProbability": 0.5
 }
