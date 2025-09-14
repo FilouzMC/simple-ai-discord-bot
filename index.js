@@ -1,13 +1,17 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Partials, Events, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, EmbedBuilder, REST, Routes, SlashCommandBuilder, ChannelType } from 'discord.js';
-import { GoogleGenerativeAI } from '@google/generative-ai';
-import path from 'node:path';
+import { Client, GatewayIntentBits, Partials, Events, MessageFlags, EmbedBuilder } from 'discord.js';
+import { CONFIG, AVAILABLE_MODELS, CURRENT_MODEL, setCurrentModel, SYSTEM_PROMPT, saveConfig, setSystemPrompt } from './lib/config.js';
+import { loadBlacklist, isUserBlacklisted, addBlacklist, removeBlacklist, listBlacklist } from './lib/blacklist.js';
+import { buildChannelContext } from './lib/context.js';
+import { generateAnswer, testGemini } from './lib/ai.js';
+import { registerSlashCommands } from './commands.js';
 import fs from 'node:fs';
+import path from 'node:path';
 
 // --- Config ---
 // Fallback modèle si config vide (ensuite géré via config.json)
 const ENV_FALLBACK_MODEL = process.env.GEMINI_MODEL || 'gemini-1.5-pro';
-const DEFAULT_LOCALE = process.env.DEFAULT_LOCALE || 'fr';
+const DEFAULT_LOCALE = process.env.DEFAULT_LOCALE || 'fr'; // réservé usage futur
 // Chargement config depuis ./config/config.json (migration depuis racine si besoin)
 const CONFIG_DIR = path.join(process.cwd(), 'config');
 const CONFIG_FILE_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -20,75 +24,10 @@ try {
     console.log('[migration] config.json déplacé vers config/config.json');
   }
 } catch (e) { console.warn('Migration config.json impossible', e); }
-let CONFIG = {};
-const DEFAULT_CONFIG = {
-  guildId: '',
-  whitelistChannelIds: [],
-  whitelistAdminUserIds: [],
-  whitelistAdminRoleIds: [],
-  // (thread features supprimés)
-  enablePromptCommand: true,
-  systemPrompt: '',
-  // threadAutoArchiveDuration supprimé
-  maxAnswerCharsPerMessage: 4000,
-  availableModels: ['gemini-2.5-pro','gemini-2.5-flash'],
-  currentModel: 'gemini-2.5-pro',
-  enableChannelContext: true,
-  channelContextMessageLimit: 6,
-  debugLogPrompts: false,
-  channelContextMaxOverride: 20,
-  channelContextAutoForgetSeconds: 0
-};
-let configNeedsWrite = false;
-try {
-  const cfgRaw = fs.readFileSync(CONFIG_FILE_PATH, 'utf8');
-  CONFIG = JSON.parse(cfgRaw);
-  // Compléter les clés manquantes
-  for (const k of Object.keys(DEFAULT_CONFIG)) {
-    if (CONFIG[k] === undefined) { CONFIG[k] = DEFAULT_CONFIG[k]; configNeedsWrite = true; }
-  }
-} catch (e) {
-  console.warn('[config] config/config.json introuvable ou invalide, création fichier défaut.');
-  CONFIG = { ...DEFAULT_CONFIG };
-  configNeedsWrite = true;
-}
-if (configNeedsWrite) {
-  try { fs.writeFileSync(CONFIG_FILE_PATH, JSON.stringify(CONFIG, null, 2), 'utf8'); console.log('[config] Fichier généré/mis à jour.'); } catch (e) { console.error('Impossible d\'écrire config par défaut', e); }
-}
+// Chargement config déjà effectué dans module config.js
 
 // --- Initialisation modèles IA ---
-let AVAILABLE_MODELS = Array.isArray(CONFIG.availableModels) ? CONFIG.availableModels.filter(m => typeof m === 'string' && m.trim()).map(m=>m.trim()) : [];
-if (!AVAILABLE_MODELS.length) AVAILABLE_MODELS = [ENV_FALLBACK_MODEL];
-if (!AVAILABLE_MODELS.includes(ENV_FALLBACK_MODEL)) AVAILABLE_MODELS.unshift(ENV_FALLBACK_MODEL);
-AVAILABLE_MODELS = Array.from(new Set(AVAILABLE_MODELS)).slice(0,25);
-CONFIG.availableModels = AVAILABLE_MODELS;
-let CURRENT_MODEL = (CONFIG.currentModel && AVAILABLE_MODELS.includes(CONFIG.currentModel)) ? CONFIG.currentModel : AVAILABLE_MODELS[0];
-CONFIG.currentModel = CURRENT_MODEL;
-
-function setCurrentModel(name) {
-  if (AVAILABLE_MODELS.includes(name)) {
-    CURRENT_MODEL = name;
-    CONFIG.currentModel = name;
-    saveConfig();
-    console.log(`[model] Modèle actuel changé -> ${CURRENT_MODEL}`);
-    return true;
-  }
-  return false;
-}
-
-let SYSTEM_PROMPT = (
-  CONFIG.systemPrompt ||
-  process.env.GEMINI_SYSTEM_PROMPT ||
-  `Tu es un assistant IA utile et concis sur un serveur Discord francophone.\n- Si la question est ambiguë, demande une clarification courte.\n- Ne révèle pas de clés ou secrets.\n- Réponses en Markdown léger.`
-).trim();
-function saveConfig() {
-  try {
-    fs.writeFileSync(CONFIG_FILE_PATH, JSON.stringify({
-      ...CONFIG,
-      systemPrompt: SYSTEM_PROMPT
-    }, null, 2), 'utf8');
-  } catch (e) { console.error('Erreur saveConfig', e); }
-}
+// (Gestion modèles & prompt fournie par config.js)
 
 // Admins: uniquement via whitelistAdminUserIds / whitelistAdminRoleIds (liste mutable pour /op)
 let ADMIN_USER_IDS = (Array.isArray(CONFIG.whitelistAdminUserIds) ? CONFIG.whitelistAdminUserIds : [])
@@ -103,8 +42,7 @@ let WHITELIST = (Array.isArray(CONFIG.whitelistChannelIds) ? CONFIG.whitelistCha
   .filter(Boolean);
 const CFG_GUILD_ID = CONFIG.guildId || process.env.GUILD_ID;
 // enableThreadTransform supprimé
-// Activation/désactivation de la commande /prompt via config.json { "enablePromptCommand": true/false }
-const ENABLE_PROMPT_COMMAND = (typeof CONFIG.enablePromptCommand === 'boolean') ? CONFIG.enablePromptCommand : true;
+// Activation/désactivation de la commande /prompt via config.json { "enablePromptCommand": true/false } (géré dans commands.js)
 // Cooldown (en secondes) entre deux transformations en thread par le même utilisateur
 // transformThreadCooldownSeconds supprimé
 // Âge max (en minutes) d'un message bot pouvant être transformé en thread (0 ou valeur <=0 = illimité)
@@ -116,17 +54,8 @@ const ENABLE_PROMPT_COMMAND = (typeof CONFIG.enablePromptCommand === 'boolean') 
 
 // Limite configurable pour tronquer/splitter les réponses IA en plusieurs messages
 // Discord limite à 4000 chars dans un embed description (et 6000 total). On autorise 500-4000.
-let MAX_ANSWER_CHARS = 4000;
-try {
-  const rawLimit = CONFIG.maxAnswerCharsPerMessage;
-  if (typeof rawLimit === 'number') {
-    const clamped = Math.max(500, Math.min(4000, rawLimit));
-    MAX_ANSWER_CHARS = clamped;
-    if (clamped !== rawLimit) { CONFIG.maxAnswerCharsPerMessage = clamped; saveConfig(); }
-  } else {
-    CONFIG.maxAnswerCharsPerMessage = MAX_ANSWER_CHARS; saveConfig();
-  }
-} catch(e) { console.warn('maxAnswerCharsPerMessage invalide, usage défaut 4000'); }
+let MAX_ANSWER_CHARS = (()=>{ const raw=CONFIG.maxAnswerCharsPerMessage; return (typeof raw==='number')? Math.max(500,Math.min(4000,raw)) : 4000; })();
+if (MAX_ANSWER_CHARS !== CONFIG.maxAnswerCharsPerMessage) { CONFIG.maxAnswerCharsPerMessage = MAX_ANSWER_CHARS; saveConfig(); }
 
 // Contexte canal (hors thread) : inclusion des derniers messages récents non-bot
 let ENABLE_CHANNEL_CONTEXT = typeof CONFIG.enableChannelContext === 'boolean' ? CONFIG.enableChannelContext : true;
@@ -144,35 +73,7 @@ if ((CHANNEL_CONTEXT_AUTO_FORGET_MS/1000) !== CONFIG.channelContextAutoForgetSec
 // Dernier usage par salon (timestamp ms)
 const channelLastContextUsage = new Map();
 
-async function buildChannelContext(channel, uptoMessageId, overrideLimit) {
-  if (!ENABLE_CHANNEL_CONTEXT) return '';
-  if (!channel?.isTextBased?.()) return '';
-  try {
-    const effLimit = overrideLimit && overrideLimit > 0 ? Math.min(CHANNEL_CONTEXT_MAX_OVERRIDE, overrideLimit) : CHANNEL_CONTEXT_LIMIT;
-    const fetched = await channel.messages.fetch({ limit: effLimit + 15 }); // marge pour filtrer
-    const botId = client.user?.id;
-    const msgs = Array.from(fetched.values())
-      .filter(m => !m.author.bot && m.id !== uptoMessageId)
-      .sort((a,b)=>a.createdTimestamp - b.createdTimestamp)
-      .filter(m => {
-        const txt = (m.content || '').trim();
-        if (txt.length <= 10) return false; // > 10 caractères
-        // retirer mentions du bot du texte
-        return true;
-      });
-    const trimmed = [];
-    for (const m of msgs) {
-      let text = m.content.replace(/<@!?\d+>/g, '').replace(/\n+/g,' ').trim();
-      if (text.length <= 10) continue;
-      trimmed.push(`${m.author.username}: ${text.slice(0,300)}`);
-    }
-    const lines = trimmed.slice(-effLimit);
-    if (!lines.length) return '';
-    return lines.join('\n');
-  } catch (e) {
-    return '';
-  }
-}
+// buildChannelContext déplacé dans lib/context.js
 
 function isChannelAllowed(channel) {
   if (!WHITELIST.length) return true; // pas de restriction
@@ -182,44 +83,7 @@ function isChannelAllowed(channel) {
   return WHITELIST.includes(channel.id);
 }
 
-// --- Blacklist JSON ---
-// Blacklist désormais dans config/blacklist.json (migration depuis racine)
-const BLACKLIST_PATH = path.join(CONFIG_DIR, 'blacklist.json');
-try {
-  const legacyBl = path.join(process.cwd(), 'blacklist.json');
-  if (fs.existsSync(legacyBl) && !fs.existsSync(BLACKLIST_PATH)) {
-    fs.renameSync(legacyBl, BLACKLIST_PATH);
-    console.log('[migration] blacklist.json déplacé vers config/blacklist.json');
-  }
-} catch (e) { console.warn('Migration blacklist.json impossible', e); }
-let blacklistCache = new Set();
-
-function loadBlacklist() {
-  try {
-    if (!fs.existsSync(BLACKLIST_PATH)) {
-      fs.writeFileSync(BLACKLIST_PATH, JSON.stringify({ users: [] }, null, 2), 'utf8');
-    }
-    const raw = fs.readFileSync(BLACKLIST_PATH, 'utf8');
-    const data = JSON.parse(raw);
-    blacklistCache = new Set((data.users || []).map(String));
-  } catch (e) {
-    console.error('Erreur chargement blacklist', e);
-    blacklistCache = new Set();
-  }
-}
-
-function saveBlacklist() {
-  try {
-    const data = { users: Array.from(blacklistCache) };
-    fs.writeFileSync(BLACKLIST_PATH, JSON.stringify(data, null, 2), 'utf8');
-  } catch (e) {
-    console.error('Erreur sauvegarde blacklist', e);
-  }
-}
-
-function isUserBlacklisted(userId) {
-  return blacklistCache.has(String(userId));
-}
+// Blacklist gérée via ./lib/blacklist.js (migration aussi effectuée là-bas)
 
 function isAdmin(userId, member) {
   if (!ADMIN_USER_IDS.length && !ADMIN_ROLE_IDS.length) return false;
@@ -231,160 +95,8 @@ function isAdmin(userId, member) {
   return false;
 }
 
-async function registerSlashCommands() {
-  // Construction des commandes (ajouter ici pour centraliser)
-  const commands = [];
-  const blacklistCmd = new SlashCommandBuilder()
-    .setName('blacklist')
-    .setDescription('Gérer la blacklist IA')
-    .addSubcommand(sc => sc.setName('add').setDescription('Ajouter un utilisateur').addUserOption(o => o.setName('utilisateur').setDescription('Utilisateur').setRequired(true)))
-    .addSubcommand(sc => sc.setName('remove').setDescription('Retirer un utilisateur').addUserOption(o => o.setName('utilisateur').setDescription('Utilisateur').setRequired(true)))
-    .addSubcommand(sc => sc.setName('list').setDescription('Lister les utilisateurs blacklists'));
-  commands.push(blacklistCmd);
-  if (ENABLE_PROMPT_COMMAND) {
-    const promptCmd = new SlashCommandBuilder()
-      .setName('prompt')
-      .setDescription('Gérer le system prompt')
-      .addSubcommand(sc => sc.setName('show').setDescription('Afficher le prompt système actuel'))
-      .addSubcommand(sc => sc.setName('set').setDescription('Définir un nouveau prompt système').addStringOption(o => o.setName('texte').setDescription('Nouveau prompt système').setRequired(true).setMaxLength(1800)));
-    commands.push(promptCmd);
-  } else {
-    console.log('[slash] /prompt désactivé par configuration (enablePromptCommand=false)');
-  }
-  // Commande options (admin) pour basculer des flags et valeurs numériques
-  const optionsCmd = new SlashCommandBuilder()
-    .setName('options')
-    .setDescription('Met à jour des options IA (admin)')
-  // options thread supprimées
-  .addIntegerOption(o => o.setName('maxanswerchars').setDescription('Taille max par message IA (500-4000)').setMinValue(500).setMaxValue(4000))
-    .addStringOption(o => {
-      o.setName('model').setDescription('Changer le modèle IA');
-      AVAILABLE_MODELS.forEach(m => o.addChoices({ name: m, value: m }));
-      return o;
-    })
-  .addBooleanOption(o => o.setName('enablechannelcontext').setDescription('Activer le contexte récent du salon (hors thread)'))
-  .addIntegerOption(o => o.setName('channelcontextlimit').setDescription('Nb messages récents salon (1-25)').setMinValue(1).setMaxValue(25))
-  .addIntegerOption(o => o.setName('channelcontextmaxoverride').setDescription('Limite max override utilisateur (1-50)').setMinValue(1).setMaxValue(50))
-  .addIntegerOption(o => o.setName('channelcontextautoforget').setDescription('Délai auto-forget contexte (sec, 0=jamais, max 86400)').setMinValue(0).setMaxValue(86400))
-  .addBooleanOption(o => o.setName('debuglogprompts').setDescription('Activer log complet des prompts (attention aux données sensibles)'))
-  // threadautoarchiveduration supprimé
-  commands.push(optionsCmd);
-  // Commande /op pour gérer les admins utilisateurs
-  const opCmd = new SlashCommandBuilder()
-    .setName('op')
-    .setDescription('Gérer la liste des admins utilisateurs')
-    .addSubcommand(sc => sc.setName('add').setDescription('Ajouter un utilisateur admin').addUserOption(o => o.setName('utilisateur').setDescription('Utilisateur').setRequired(true)))
-    .addSubcommand(sc => sc.setName('remove').setDescription('Retirer un utilisateur admin').addUserOption(o => o.setName('utilisateur').setDescription('Utilisateur').setRequired(true)))
-    .addSubcommand(sc => sc.setName('list').setDescription('Lister les utilisateurs admin')); 
-  commands.push(opCmd);
-
-  // Commande whitelistchannels (admin)
-  const wlCmd = new SlashCommandBuilder()
-    .setName('whitelistchannels')
-    .setDescription('Gérer la whitelist des salons IA (admin)')
-    .addSubcommand(sc => sc
-      .setName('add')
-      .setDescription('Ajouter un salon à la whitelist')
-      .addChannelOption(o => o.setName('salon').setDescription('Salon texte').addChannelTypes(ChannelType.GuildText).setRequired(true)))
-    .addSubcommand(sc => sc
-      .setName('remove')
-      .setDescription('Retirer un salon de la whitelist')
-      .addChannelOption(o => o.setName('salon').setDescription('Salon texte').addChannelTypes(ChannelType.GuildText).setRequired(true)))
-    .addSubcommand(sc => sc
-      .setName('list')
-      .setDescription('Lister les salons whitelists'));
-  commands.push(wlCmd);
-
-  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  const scope = CFG_GUILD_ID ? `guild:${CFG_GUILD_ID}` : 'global';
-  const names = commands.map(c => `/${c.name}`).join(', ');
-  const started = Date.now();
-  console.log(`[slash] Début enregistrement scope=${scope} total=${commands.length} -> ${names}`);
-  try {
-    const route = CFG_GUILD_ID ? Routes.applicationGuildCommands(client.user.id, CFG_GUILD_ID) : Routes.applicationCommands(client.user.id);
-    const body = commands.map(c => c.toJSON());
-    const data = await rest.put(route, { body });
-    const ms = Date.now() - started;
-    if (Array.isArray(data)) {
-      // Log détaillé (nom + id Discord renvoyé)
-      data.forEach(d => {
-        if (d?.name && d?.id) console.log(`[slash] ✔ ${d.name} id=${d.id}`);
-      });
-    }
-    console.log(`[slash] Enregistrement terminé (${scope}) en ${ms}ms` + (scope === 'global' ? ' (propagation globale ~1h possible)' : ''));
-  } catch (e) {
-    console.error(`[slash] Échec enregistrement scope=${scope}`, e);
-  }
-}
-
 // (SQLite/thread memory supprimé)
-
-// --- Gemini Setup ---
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-
-async function generateAnswer({ userQuestion, channelContext }) {
-  const started = Date.now();
-  const prompt = [
-    '----- PROMPT START -----',
-    SYSTEM_PROMPT,
-    channelContext ? 'Contexte récent :' : null,
-    channelContext ? channelContext : null,
-    `UTILISATEUR : ${userQuestion}`,
-    '----- PROMPT END -----'
-  ].filter(Boolean).join('\n\n');
-  const model = genAI.getGenerativeModel({ model: CURRENT_MODEL });
-  if (DEBUG_LOG_PROMPTS) {
-    try {
-      console.log(`[#debug][prompt] model=${CURRENT_MODEL} length=${prompt.length}\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
-    } catch {}
-  }
-  try {
-    const result = await withTimeout(model.generateContent(prompt), 25000, 'Délai de génération dépassé');
-    const response = result.response.text();
-    if (DEBUG_LOG_PROMPTS) {
-      try {
-        console.log(`[#debug][response] length=${(response||'').length}\n----- RESPONSE START -----\n${response}\n----- RESPONSE END -----`);
-      } catch {}
-    }
-    return { ok: true, text: (response || '').trim() || 'Réponse vide reçue.', ms: Date.now()-started };
-  } catch (e) {
-    const errMsg = e?.message || String(e);
-    if (DEBUG_LOG_PROMPTS) {
-      try {
-        console.log(`[#debug][error] model=${CURRENT_MODEL} err="${errMsg}"`);
-      } catch {}
-    }
-    console.error('Erreur generateAnswer', e);
-    return { ok: false, error: errMsg, ms: Date.now()-started };
-  }
-}
-
-// generateThreadTitle supprimé
-
-function withTimeout(promise, ms, label = 'Timeout') {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(label)), ms);
-  });
-  return Promise.race([
-    promise.finally(() => clearTimeout(timer)),
-    timeout
-  ]);
-}
-
-async function testGemini() {
-  try {
-    if (!process.env.GEMINI_API_KEY) return { ok: false, error: 'CLE API GEMINI absente' };
-  const model = genAI.getGenerativeModel({ model: CURRENT_MODEL });
-    const r = await model.generateContent('ping');
-    const text = r.response.text().slice(0, 40);
-    return { ok: true, sample: text };
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
-  }
-}
-
-// testDb supprimé
+// Fonctions IA, commandes et blacklist gérées par modules dédiés
 
 // --- Discord Client ---
 const client = new Client({
@@ -401,14 +113,12 @@ const client = new Client({
 
 // ensureDb supprimé
 
-function isBotMentioned(message) {
-  return message.mentions.has(client.user) || message.mentions.users.some(u => u.id === client.user?.id);
-}
+function isBotMentioned(message) { return message.mentions.has(client.user) || message.mentions.users.some(u => u.id === client.user?.id); }
 
 client.once(Events.ClientReady, () => {
   console.log(`[bot] Connecté en tant que ${client.user.tag}`);
   loadBlacklist();
-  registerSlashCommands();
+  registerSlashCommands(client);
 });
 
 client.on(Events.MessageCreate, async (message) => {
@@ -503,10 +213,10 @@ client.on(Events.MessageCreate, async (message) => {
       }
     }
     if (allowContext) {
-      try { channelContext = await buildChannelContext(message.channel, message.id, overrideContextCount); } catch {}
+  try { channelContext = await buildChannelContext({ channel: message.channel, uptoMessageId: message.id, overrideLimit: overrideContextCount, limit: CHANNEL_CONTEXT_LIMIT, maxOverride: CHANNEL_CONTEXT_MAX_OVERRIDE, botId }); } catch {}
       channelLastContextUsage.set(message.channel.id, Date.now());
     }
-    const answerResult = await generateAnswer({ userQuestion: content, channelContext });
+  const answerResult = await generateAnswer({ userQuestion: content, channelContext, debug: DEBUG_LOG_PROMPTS });
     active = false; await typingLoop.catch(()=>{});
 
   if (answerResult.ok) { try { console.log(`[ai] answer user=${message.author.id} len=${answerResult.text.length}`); } catch {} } else { try { console.log(`[ai] error user=${message.author.id} err=${answerResult.error}`); } catch {} }
@@ -581,7 +291,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // Log exécution commande (avant permission pour audit)
   let subName = ''; try { subName = interaction.options.getSubcommand(); } catch {}
   try { console.log(`[slash] cmd=/${interaction.commandName}${subName?` sub=${subName}`:''} user=${interaction.user.tag} (${interaction.user.id})`); } catch {}
-      if (interaction.commandName === 'blacklist') {
+    if (interaction.commandName === 'blacklist') {
   if (!isAdmin(interaction.user.id, interaction.member)) {
           await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
           return;
@@ -593,29 +303,27 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await interaction.reply({ content: `${user} est déjà blacklist.`, flags: MessageFlags.Ephemeral });
             return;
           }
-            blacklistCache.add(String(user.id));
-            saveBlacklist();
-            await interaction.reply({ content: `${user} ajouté à la blacklist.`, flags: MessageFlags.Ephemeral });
-            return;
+      addBlacklist(user.id);
+      await interaction.reply({ content: `${user} ajouté à la blacklist.`, flags: MessageFlags.Ephemeral });
+      return;
         } else if (sub === 'remove') {
           const user = interaction.options.getUser('utilisateur', true);
           if (!isUserBlacklisted(user.id)) {
             await interaction.reply({ content: `${user} n'est pas blacklist.`, flags: MessageFlags.Ephemeral });
             return;
           }
-          blacklistCache.delete(String(user.id));
-          saveBlacklist();
-          await interaction.reply({ content: `${user} retiré de la blacklist.`, flags: MessageFlags.Ephemeral });
-          return;
+      removeBlacklist(user.id);
+      await interaction.reply({ content: `${user} retiré de la blacklist.`, flags: MessageFlags.Ephemeral });
+      return;
         } else if (sub === 'list') {
-          const users = Array.from(blacklistCache);
+      const users = listBlacklist();
           const display = users.length ? users.map(id => `<@${id}>`).join(', ') : 'Aucun';
           await interaction.reply({ content: `Blacklist (${users.length}): ${display}`, flags: MessageFlags.Ephemeral });
           return;
         }
       }
       if (interaction.commandName === 'prompt') {
-        if (!ENABLE_PROMPT_COMMAND) {
+        if (!CONFIG.enablePromptCommand) {
           await interaction.reply({ content: 'La commande /prompt est désactivée.', flags: MessageFlags.Ephemeral });
           return;
         }
@@ -632,13 +340,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
         }
         if (sub === 'set') {
           const texte = interaction.options.getString('texte', true).trim();
-          if (!texte) {
-            await interaction.reply({ content: 'Prompt vide.', flags: MessageFlags.Ephemeral });
-            return;
-          }
-          SYSTEM_PROMPT = texte;
-          CONFIG.systemPrompt = texte;
-          saveConfig();
+          if (!texte) { await interaction.reply({ content: 'Prompt vide.', flags: MessageFlags.Ephemeral }); return; }
+          setSystemPrompt(texte);
           await interaction.reply({ content: 'Prompt système mis à jour.', flags: MessageFlags.Ephemeral });
           return;
         }
