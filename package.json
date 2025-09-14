@@ -7,12 +7,14 @@
   },
   "name": "simple-gemini-discord-bot",
   "version": "1.0.0",
-  "description": "A Discord bot to chat with Gemini (memory system, automatic thread creation), entirely written with pure vibe coding.",
+  "description": "Bot Discord (2025) utilisant Google Gemini + mémoire de conversation par thread via SQLite.",
   "main": "index.js",
   "type": "module",
   "devDependencies": {},
   "scripts": {
-    "start": "node index.js"  },
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
   "author": "Filouz",
   "license": "MIT"
 }

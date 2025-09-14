@@ -1,7 +1,6 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits, Partials, Events, ActionRowBuilder, ButtonBuilder, ButtonStyle, ThreadAutoArchiveDuration, MessageFlags, EmbedBuilder, PermissionsBitField, REST, Routes, SlashCommandBuilder, ChannelType } from 'discord.js';
+import { Client, GatewayIntentBits, Partials, Events, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags, EmbedBuilder, REST, Routes, SlashCommandBuilder, ChannelType } from 'discord.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import sqlite3 from 'sqlite3';
 import path from 'node:path';
 import fs from 'node:fs';
 
@@ -27,12 +26,10 @@ const DEFAULT_CONFIG = {
   whitelistChannelIds: [],
   whitelistAdminUserIds: [],
   whitelistAdminRoleIds: [],
-  enableThreadTransform: true,
-  transformThreadCooldownSeconds: 60,
-  transformThreadMaxMessageAgeMinutes: 30,
+  // (thread features supprimés)
   enablePromptCommand: true,
   systemPrompt: '',
-  threadAutoArchiveDuration: '24h',
+  // threadAutoArchiveDuration supprimé
   maxAnswerCharsPerMessage: 4000,
   availableModels: ['gemini-2.5-pro','gemini-2.5-flash'],
   currentModel: 'gemini-2.5-pro',
@@ -105,41 +102,17 @@ let WHITELIST = (Array.isArray(CONFIG.whitelistChannelIds) ? CONFIG.whitelistCha
   .map(s => String(s).trim())
   .filter(Boolean);
 const CFG_GUILD_ID = CONFIG.guildId || process.env.GUILD_ID;
-let ENABLE_THREAD_TRANSFORM = (typeof CONFIG.enableThreadTransform === 'boolean') ? CONFIG.enableThreadTransform : true;
+// enableThreadTransform supprimé
 // Activation/désactivation de la commande /prompt via config.json { "enablePromptCommand": true/false }
 const ENABLE_PROMPT_COMMAND = (typeof CONFIG.enablePromptCommand === 'boolean') ? CONFIG.enablePromptCommand : true;
 // Cooldown (en secondes) entre deux transformations en thread par le même utilisateur
-let TRANSFORM_THREAD_COOLDOWN_MS = (
-  typeof CONFIG.transformThreadCooldownSeconds === 'number' && CONFIG.transformThreadCooldownSeconds >= 0
-    ? CONFIG.transformThreadCooldownSeconds
-    : 60 // défaut 60s
-) * 1000;
+// transformThreadCooldownSeconds supprimé
 // Âge max (en minutes) d'un message bot pouvant être transformé en thread (0 ou valeur <=0 = illimité)
-let TRANSFORM_THREAD_MAX_MESSAGE_AGE_MS = (
-  typeof CONFIG.transformThreadMaxMessageAgeMinutes === 'number' && CONFIG.transformThreadMaxMessageAgeMinutes > 0
-    ? CONFIG.transformThreadMaxMessageAgeMinutes
-    : 30 // défaut 30 minutes
-) * 60 * 1000;
+// transformThreadMaxMessageAgeMinutes supprimé
 
 // Durée d'auto-archivage configurable (Discord supporte: 60, 1440, 4320, 10080 minutes => 1h, 24h, 3d, 7d)
 // Valeurs admises dans config: "1h", "24h", "3d", "1w" (week=7d)
-let THREAD_AUTO_ARCHIVE_DURATION = ThreadAutoArchiveDuration.OneDay;
-const THREAD_AUTO_ARCHIVE_MAP = {
-  '1h': ThreadAutoArchiveDuration.OneHour,
-  '24h': ThreadAutoArchiveDuration.OneDay,
-  '3d': ThreadAutoArchiveDuration.ThreeDays,
-  '1w': ThreadAutoArchiveDuration.OneWeek
-};
-function setThreadAutoArchiveFromKey(key) {
-  const k = String(key || '').trim().toLowerCase();
-  if (THREAD_AUTO_ARCHIVE_MAP[k] !== undefined) {
-    THREAD_AUTO_ARCHIVE_DURATION = THREAD_AUTO_ARCHIVE_MAP[k];
-    CONFIG.threadAutoArchiveDuration = k; // persiste dans config lors de saveConfig
-    return true;
-  }
-  return false;
-}
-try { setThreadAutoArchiveFromKey(CONFIG.threadAutoArchiveDuration || '24h'); } catch (e) { console.warn('threadAutoArchiveDuration invalide, utilisation défaut 24h'); }
+// thread auto-archive (supprimé)
 
 // Limite configurable pour tronquer/splitter les réponses IA en plusieurs messages
 // Discord limite à 4000 chars dans un embed description (et 6000 total). On autorise 500-4000.
@@ -175,16 +148,27 @@ async function buildChannelContext(channel, uptoMessageId, overrideLimit) {
   if (!ENABLE_CHANNEL_CONTEXT) return '';
   if (!channel?.isTextBased?.()) return '';
   try {
-  const effLimit = overrideLimit && overrideLimit > 0 ? Math.min(CHANNEL_CONTEXT_MAX_OVERRIDE, overrideLimit) : CHANNEL_CONTEXT_LIMIT;
-  const fetched = await channel.messages.fetch({ limit: effLimit + 5 }); // un peu plus pour filtrer bots
-    // Trier chronologiquement
+    const effLimit = overrideLimit && overrideLimit > 0 ? Math.min(CHANNEL_CONTEXT_MAX_OVERRIDE, overrideLimit) : CHANNEL_CONTEXT_LIMIT;
+    const fetched = await channel.messages.fetch({ limit: effLimit + 15 }); // marge pour filtrer
+    const botId = client.user?.id;
     const msgs = Array.from(fetched.values())
       .filter(m => !m.author.bot && m.id !== uptoMessageId)
       .sort((a,b)=>a.createdTimestamp - b.createdTimestamp)
-  .slice(-effLimit);
-    if (!msgs.length) return '';
-    const lines = msgs.map(m => `${m.author.username}: ${m.content.replace(/\n+/g,' ').slice(0,300)}`);
-    return `Contexte récent du salon (dernier${lines.length>1?'s':''} messages):\n"""\n${lines.join('\n')}\n"""\n`;
+      .filter(m => {
+        const txt = (m.content || '').trim();
+        if (txt.length <= 10) return false; // > 10 caractères
+        // retirer mentions du bot du texte
+        return true;
+      });
+    const trimmed = [];
+    for (const m of msgs) {
+      let text = m.content.replace(/<@!?\d+>/g, '').replace(/\n+/g,' ').trim();
+      if (text.length <= 10) continue;
+      trimmed.push(`${m.author.username}: ${text.slice(0,300)}`);
+    }
+    const lines = trimmed.slice(-effLimit);
+    if (!lines.length) return '';
+    return lines.join('\n');
   } catch (e) {
     return '';
   }
@@ -271,8 +255,7 @@ async function registerSlashCommands() {
   const optionsCmd = new SlashCommandBuilder()
     .setName('options')
     .setDescription('Met à jour des options IA (admin)')
-    .addBooleanOption(o => o.setName('enablethreadtransform').setDescription('Activer le bouton Transformer en thread'))
-    .addIntegerOption(o => o.setName('transformthreadcooldownseconds').setDescription('Cooldown global utilisateur (secondes, 0=off, >=0)').setMinValue(0).setMaxValue(86400))
+  // options thread supprimées
   .addIntegerOption(o => o.setName('maxanswerchars').setDescription('Taille max par message IA (500-4000)').setMinValue(500).setMaxValue(4000))
     .addStringOption(o => {
       o.setName('model').setDescription('Changer le modèle IA');
@@ -284,16 +267,7 @@ async function registerSlashCommands() {
   .addIntegerOption(o => o.setName('channelcontextmaxoverride').setDescription('Limite max override utilisateur (1-50)').setMinValue(1).setMaxValue(50))
   .addIntegerOption(o => o.setName('channelcontextautoforget').setDescription('Délai auto-forget contexte (sec, 0=jamais, max 86400)').setMinValue(0).setMaxValue(86400))
   .addBooleanOption(o => o.setName('debuglogprompts').setDescription('Activer log complet des prompts (attention aux données sensibles)'))
-    .addStringOption(o => o
-      .setName('threadautoarchiveduration')
-      .setDescription('Durée auto-archivage threads (1h,24h,3d,1w)')
-      .addChoices(
-        { name: '1h', value: '1h' },
-        { name: '24h', value: '24h' },
-        { name: '3d', value: '3d' },
-        { name: '1w', value: '1w' }
-      )
-    );
+  // threadautoarchiveduration supprimé
   commands.push(optionsCmd);
   // Commande /op pour gérer les admins utilisateurs
   const opCmd = new SlashCommandBuilder()
@@ -343,176 +317,49 @@ async function registerSlashCommands() {
   }
 }
 
-// --- SQLite Setup ---
-// Base SQLite aussi déplacée dans config/
-const DB_PATH = path.join(CONFIG_DIR, 'memory.db');
-try {
-  const legacyDb = path.join(process.cwd(), 'memory.db');
-  if (fs.existsSync(legacyDb) && !fs.existsSync(DB_PATH)) {
-    fs.renameSync(legacyDb, DB_PATH);
-    console.log('[migration] memory.db déplacé vers config/memory.db');
-  }
-} catch (e) { console.warn('Migration memory.db impossible', e); }
-let db;
-function initDb() {
-  return new Promise((resolve, reject) => {
-    const sqlite = sqlite3.verbose();
-    db = new sqlite.Database(DB_PATH, (err) => {
-      if (err) return reject(err);
-      db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS memory (\n          thread_id TEXT NOT NULL,\n          role TEXT NOT NULL,\n            content TEXT NOT NULL,\n            ts INTEGER NOT NULL\n        );`);
-  db.run(`CREATE INDEX IF NOT EXISTS idx_memory_thread_ts ON memory(thread_id, ts);`);
-  db.run(`CREATE TABLE IF NOT EXISTS thread_meta (\n          thread_id TEXT PRIMARY KEY,\n          owner_id TEXT NOT NULL,\n          locked INTEGER DEFAULT 0,\n          created_ts INTEGER NOT NULL\n        );`);
-  db.run(`CREATE TABLE IF NOT EXISTS thread_transform_log (\n          message_id TEXT NOT NULL,\n          user_id TEXT NOT NULL,\n          thread_id TEXT NOT NULL,\n          ts INTEGER NOT NULL,\n          PRIMARY KEY(message_id, user_id)\n        );`);
-        resolve();});
-    });
-  });
-}
-
-function addMessage(threadId, role, content) {
-  return new Promise((resolve, reject) => {
-    db.run(`INSERT INTO memory (thread_id, role, content, ts) VALUES (?, ?, ?, ?)`, [threadId, role, content, Date.now()], (err) => {
-      if (err) return reject(err);
-      resolve();
-    });
-  });
-}
-
-function getThreadMemory(threadId, limit = 15) {
-  return new Promise((resolve, reject) => {
-    db.all(`SELECT role, content FROM memory WHERE thread_id = ? ORDER BY ts DESC LIMIT ?`, [threadId, limit], (err, rows) => {
-      if (err) return reject(err);
-      resolve(rows.reverse());
-    });
-  });
-}
-
-// --- Thread Meta Helpers ---
-function setThreadOwner(threadId, ownerId) {
-  return new Promise((resolve, reject) => {
-    db.run(`INSERT INTO thread_meta(thread_id, owner_id, locked, created_ts) VALUES(?,?,0,?)\n      ON CONFLICT(thread_id) DO UPDATE SET owner_id=excluded.owner_id`, [threadId, ownerId, Date.now()], (err) => {
-      if (err) return reject(err);
-      resolve();
-    });
-  });
-}
-
-function getThreadMeta(threadId) {
-  return new Promise((resolve, reject) => {
-    db.get(`SELECT thread_id, owner_id, locked FROM thread_meta WHERE thread_id = ?`, [threadId], (err, row) => {
-      if (err) return reject(err);
-      resolve(row || null);
-    });
-  });
-}
-
-function lockThreadMeta(threadId) {
-  return new Promise((resolve, reject) => {
-    db.run(`UPDATE thread_meta SET locked = 1 WHERE thread_id = ?`, [threadId], (err) => {
-      if (err) return reject(err);
-      resolve();
-    });
-  });
-}
-
-function setThreadUnlocked(threadId) {
-  return new Promise((resolve, reject) => {
-    db.run(`UPDATE thread_meta SET locked = 0 WHERE thread_id = ?`, [threadId], (err) => {
-      if (err) return reject(err);
-      resolve();
-    });
-  });
-}
-
-function recordTransform(messageId, userId, threadId) {
-  return new Promise((resolve, reject) => {
-    db.run(`INSERT OR IGNORE INTO thread_transform_log(message_id,user_id,thread_id,ts) VALUES(?,?,?,?)`, [messageId, userId, threadId, Date.now()], (err) => {
-      if (err) return reject(err);
-      resolve();
-    });
-  });
-}
-
-function hasUserTransformed(messageId, userId) {
-  return new Promise((resolve, reject) => {
-    db.get(`SELECT thread_id FROM thread_transform_log WHERE message_id = ? AND user_id = ?`, [messageId, userId], (err, row) => {
-      if (err) return reject(err);
-      resolve(!!row);
-    });
-  });
-}
-
-function getLastTransformTs(userId) {
-  return new Promise((resolve, reject) => {
-    db.get(`SELECT ts FROM thread_transform_log WHERE user_id = ? ORDER BY ts DESC LIMIT 1`, [userId], (err, row) => {
-      if (err) return reject(err);
-      resolve(row ? row.ts : null);
-    });
-  });
-}
-
-async function syncThreadLock(thread) {
-  try {
-    if (!thread?.isThread?.()) return;
-    await ensureDb();
-    const meta = await getThreadMeta(thread.id);
-    const discordLocked = thread.locked || thread.archived;
-    if (discordLocked && meta && !meta.locked) {
-      await lockThreadMeta(thread.id);
-    } else if (!discordLocked && meta?.locked) {
-      await setThreadUnlocked(thread.id);
-    }
-  } catch (e) {
-    console.error('syncThreadLock error', e);
-  }
-}
+// (SQLite/thread memory supprimé)
 
 // --- Gemini Setup ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
 
-async function generateAnswer({ threadId, userQuestion, channelContext }) {
-  try {
-    const history = threadId ? await getThreadMemory(threadId) : [];
-  const prior = history.map(h => `${h.role.toUpperCase()}: ${h.content}`).join('\n');
-  const parts = [SYSTEM_PROMPT];
-  if (channelContext) parts.push(channelContext.trim());
-  if (prior) parts.push(prior);
-  parts.push(`UTILISATEUR: ${userQuestion}`, 'ASSISTANT:');
-  const prompt = parts.filter(Boolean).join('\n\n');
+async function generateAnswer({ userQuestion, channelContext }) {
+  const started = Date.now();
+  const prompt = [
+    '----- PROMPT START -----',
+    SYSTEM_PROMPT,
+    channelContext ? 'Contexte récent :' : null,
+    channelContext ? channelContext : null,
+    `UTILISATEUR : ${userQuestion}`,
+    '----- PROMPT END -----'
+  ].filter(Boolean).join('\n\n');
   const model = genAI.getGenerativeModel({ model: CURRENT_MODEL });
   if (DEBUG_LOG_PROMPTS) {
     try {
-      console.log(`[debug][prompt] model=${CURRENT_MODEL} length=${prompt.length}\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
+      console.log(`[#debug][prompt] model=${CURRENT_MODEL} length=${prompt.length}\n----- PROMPT START -----\n${prompt}\n----- PROMPT END -----`);
     } catch {}
   }
-
+  try {
     const result = await withTimeout(model.generateContent(prompt), 25000, 'Délai de génération dépassé');
     const response = result.response.text();
     if (DEBUG_LOG_PROMPTS) {
-      try { console.log(`[debug][response] length=${(response||'').length}\n----- RESPONSE START -----\n${response}\n----- RESPONSE END -----`); } catch {}
+      try {
+        console.log(`[#debug][response] length=${(response||'').length}\n----- RESPONSE START -----\n${response}\n----- RESPONSE END -----`);
+      } catch {}
     }
-    return (response || '').trim() || 'Réponse vide reçue.';
+    return { ok: true, text: (response || '').trim() || 'Réponse vide reçue.', ms: Date.now()-started };
   } catch (e) {
+    const errMsg = e?.message || String(e);
+    if (DEBUG_LOG_PROMPTS) {
+      try {
+        console.log(`[#debug][error] model=${CURRENT_MODEL} err="${errMsg}"`);
+      } catch {}
+    }
     console.error('Erreur generateAnswer', e);
-    return 'Une erreur est survenue lors de la génération de la réponse.';
+    return { ok: false, error: errMsg, ms: Date.now()-started };
   }
 }
 
-async function generateThreadTitle({ question, answer }) {
-  try {
-  const model = genAI.getGenerativeModel({ model: CURRENT_MODEL });
-    const prompt = `Génère un titre très court (5-7 mots max) en français, descriptif et neutre pour une discussion sur Discord basée sur la question et la réponse suivantes.\n- Pas d'émojis.\n- Pas de guillemets.\n- Pas de ponctuation finale.\nQuestion: ${question}\nRéponse: ${answer}\nTitre:`;
-    const res = await withTimeout(model.generateContent(prompt), 15000, 'Timeout titre');
-    let title = res.response.text().split('\n')[0].trim();
-    if (!title) title = question.slice(0, 60);
-    title = title.replace(/["'`\n]/g, ' ').replace(/\s+/g, ' ').trim();
-    if (title.length > 72) title = title.slice(0, 72).trim();
-    return `[IA] ${title}`;
-  } catch (e) {
-    console.error('Erreur génération titre thread', e);
-    return '[IA] Discussion';
-  }
-}
+// generateThreadTitle supprimé
 
 function withTimeout(promise, ms, label = 'Timeout') {
   let timer;
@@ -537,20 +384,7 @@ async function testGemini() {
   }
 }
 
-async function testDb() {
-  try {
-    await ensureDb();
-    await addMessage('_probe', 'system', 'probe');
-    return new Promise((resolve) => {
-      db.get('SELECT 1 as ok FROM memory WHERE thread_id = ? ORDER BY ts DESC LIMIT 1', ['_probe'], (err, row) => {
-        if (err) return resolve({ ok: false, error: err.message });
-        resolve({ ok: true });
-      });
-    });
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
-  }
-}
+// testDb supprimé
 
 // --- Discord Client ---
 const client = new Client({
@@ -563,51 +397,9 @@ const client = new Client({
   partials: [Partials.Channel, Partials.Message]
 });
 
-function buildThreadButton() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('make-thread')
-      .setLabel('Transformer en thread')
-      .setStyle(ButtonStyle.Secondary)
-  );
-}
+// Boutons liés aux threads supprimés
 
-function buildThreadControlButtons(opts = {}) {
-  const { locked = false } = opts;
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('lock-thread')
-      .setLabel(locked ? 'Verrouillé' : 'Verrouiller')
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(locked),
-    new ButtonBuilder()
-      .setCustomId('close-thread')
-      .setLabel('Fermer le fil')
-      .setStyle(ButtonStyle.Secondary)
-      .setDisabled(false),
-    new ButtonBuilder()
-      .setCustomId('delete-thread')
-      .setLabel('Supprimer')
-      .setStyle(ButtonStyle.Danger)
-  );
-}
-
-function buildConfirmRow(action) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`confirm-${action}`)
-      .setLabel('Confirmer')
-      .setStyle(ButtonStyle.Danger),
-    new ButtonBuilder()
-      .setCustomId('cancel-action')
-      .setLabel('Annuler')
-      .setStyle(ButtonStyle.Secondary)
-  );
-}
-
-async function ensureDb() {
-  if (!db) await initDb();
-}
+// ensureDb supprimé
 
 function isBotMentioned(message) {
   return message.mentions.has(client.user) || message.mentions.users.some(u => u.id === client.user?.id);
@@ -638,24 +430,16 @@ client.on(Events.MessageCreate, async (message) => {
       } catch {}
     }
 
-    // Contexte thread
-    const inThread = !!message.thread || message.channel.isThread?.();
-    const threadChannel = inThread ? (message.thread || message.channel) : null;
+  // Règle: mentionner le bot ou répondre à lui
+  if (!mentioned && !replyToBot) return;
 
-    // Nouvelle règle: il faut soit mentionner le bot, soit répondre à un de ses messages
-    if (!mentioned && !replyToBot) return;
-
-    // Détermination threadId pour mémoire (si thread) sinon null
-    const threadId = threadChannel?.id || null;
-
-    // Commande diagnostic: mention + !diag
+    // Commande diagnostic: mention + !diag (DB retirée)
     if (mentioned && message.content.includes('!diag')) {
-      const [dbStatus, gemStatus] = await Promise.all([testDb(), testGemini()]);
+      const gemStatus = await testGemini();
       const details = [
-        `DB: ${dbStatus.ok ? 'OK' : 'ERREUR'}${dbStatus.error ? ` (${dbStatus.error})` : ''}`,
         `Gemini: ${gemStatus.ok ? 'OK' : 'ERREUR'}${gemStatus.error ? ` (${gemStatus.error})` : gemStatus.sample ? ` (extrait: ${gemStatus.sample})` : ''}`,
         `Node: ${process.version}`,
-  `Model: ${CURRENT_MODEL}`
+        `Model: ${CURRENT_MODEL}`
       ].join('\n');
       await message.reply({ content: 'Diagnostic:\n' + details, allowedMentions: { repliedUser: false } });
       return;
@@ -696,11 +480,9 @@ client.on(Events.MessageCreate, async (message) => {
       }
     }
 
-    await ensureDb();
-
     // Log début interaction IA
     try {
-      console.log(`[ai] question user=${message.author.tag} (${message.author.id}) channel=${message.channel.id}${threadId ? ` thread=${threadId}` : ''} len=${content.length}${overrideContextCount?` overrideCtx=${overrideContextCount}`:''}`);
+  console.log(`[ai] question user=${message.author.tag} (${message.author.id}) channel=${message.channel.id} len=${content.length}${overrideContextCount?` overrideCtx=${overrideContextCount}`:''}`);
     } catch {}
 
     let active = true;
@@ -710,36 +492,44 @@ client.on(Events.MessageCreate, async (message) => {
         await new Promise(r => setTimeout(r, 7000));
       }
     })();
-    // Contexte channel (uniquement hors thread)
+    // Contexte channel
     let channelContext = '';
-    if (!threadId) {
-      let allowContext = true;
-      if (CHANNEL_CONTEXT_AUTO_FORGET_MS > 0) {
-        const lastTs = channelLastContextUsage.get(message.channel.id) || 0;
-        const elapsed = Date.now() - lastTs;
-        if (elapsed > CHANNEL_CONTEXT_AUTO_FORGET_MS && !overrideContextCount) {
-          allowContext = false; // oublié automatiquement
-        }
-      }
-      if (allowContext) {
-        try { channelContext = await buildChannelContext(message.channel, message.id, overrideContextCount); } catch {}
-        channelLastContextUsage.set(message.channel.id, Date.now());
+    let allowContext = true;
+    if (CHANNEL_CONTEXT_AUTO_FORGET_MS > 0) {
+      const lastTs = channelLastContextUsage.get(message.channel.id) || 0;
+      const elapsed = Date.now() - lastTs;
+      if (elapsed > CHANNEL_CONTEXT_AUTO_FORGET_MS && !overrideContextCount) {
+        allowContext = false; // oublié automatiquement
       }
     }
-    const answer = await generateAnswer({ threadId, userQuestion: content, channelContext });
+    if (allowContext) {
+      try { channelContext = await buildChannelContext(message.channel, message.id, overrideContextCount); } catch {}
+      channelLastContextUsage.set(message.channel.id, Date.now());
+    }
+    const answerResult = await generateAnswer({ userQuestion: content, channelContext });
     active = false; await typingLoop.catch(()=>{});
 
-  try { console.log(`[ai] answer user=${message.author.id} len=${answer.length}`); } catch {}
+  if (answerResult.ok) { try { console.log(`[ai] answer user=${message.author.id} len=${answerResult.text.length}`); } catch {} } else { try { console.log(`[ai] error user=${message.author.id} err=${answerResult.error}`); } catch {} }
 
-    // Sauvegarde mémoire si thread
-    if (threadId) {
-      try { await addMessage(threadId, 'user', content); } catch (e) { console.error('Erreur save user msg', e); }
-      try { await addMessage(threadId, 'assistant', answer); } catch (e) { console.error('Erreur save assistant msg', e); }
-    }
-
-  const components = (inThread || !ENABLE_THREAD_TRANSFORM) ? [] : [buildThreadButton()];
+  const components = []; // plus de bouton thread
     try {
       // Découpage si au-delà limite configurée
+      if (!answerResult.ok) {
+        const embed = new EmbedBuilder()
+          .setColor(0xED4245)
+          .setTitle('Erreur génération IA')
+          .addFields(
+            { name: 'Message', value: answerResult.error.slice(0, 1024) },
+            { name: 'Durée ms', value: String(answerResult.ms), inline: true },
+            { name: 'Modèle', value: CURRENT_MODEL, inline: true }
+          )
+          .setFooter({ text: 'Réessaie plus tard ou modifie ta requête.' })
+          .setTimestamp(new Date());
+        await message.reply({ embeds: [embed], allowedMentions: { repliedUser: false } });
+        return;
+      }
+
+      const answer = answerResult.text;
       const chunks = [];
       if (answer.length <= MAX_ANSWER_CHARS) {
         chunks.push(answer);
@@ -747,20 +537,16 @@ client.on(Events.MessageCreate, async (message) => {
         let remaining = answer;
         while (remaining.length) {
           let slice = remaining.slice(0, MAX_ANSWER_CHARS);
-          // Essayons de couper proprement sur une fin de phrase ou saut de ligne si possible
           if (remaining.length > MAX_ANSWER_CHARS) {
             const lastBreak = slice.lastIndexOf('\n');
             const lastDot = slice.lastIndexOf('. ');
             const candidate = Math.max(lastBreak, lastDot);
-            if (candidate > MAX_ANSWER_CHARS * 0.5) {
-              slice = slice.slice(0, candidate + 1);
-            }
+            if (candidate > MAX_ANSWER_CHARS * 0.5) slice = slice.slice(0, candidate + 1);
           }
           chunks.push(slice);
           remaining = remaining.slice(slice.length).trimStart();
         }
       }
-
       let firstReplyMessage = null;
       for (let i = 0; i < chunks.length; i++) {
         const part = chunks[i];
@@ -768,6 +554,7 @@ client.on(Events.MessageCreate, async (message) => {
           .setColor(0x5865F2)
           .setAuthor({ name: 'Réponse IA' + (chunks.length > 1 ? ` (partie ${i+1}/${chunks.length})` : ''), iconURL: client.user.displayAvatarURL?.() })
           .setDescription(part)
+          .addFields({ name: 'Durée ms', value: String(answerResult.ms), inline: true })
           .setFooter({ text: `Modèle: ${CURRENT_MODEL} • Mentionne de nouveau pour continuer` })
           .setTimestamp(new Date());
         const comps = (i === 0) ? components : [];
@@ -863,9 +650,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
           return;
         }
-        const newEnable = interaction.options.getBoolean('enablethreadtransform');
-        const newCooldown = interaction.options.getInteger('transformthreadcooldownseconds');
-        const newArchive = interaction.options.getString('threadautoarchiveduration');
+  // options thread supprimées
         const newMaxChars = interaction.options.getInteger('maxanswerchars');
         const newModel = interaction.options.getString('model');
         const newEnableChanCtx = interaction.options.getBoolean('enablechannelcontext');
@@ -873,35 +658,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const newDebugLog = interaction.options.getBoolean('debuglogprompts');
         const newChanCtxMaxOverride = interaction.options.getInteger('channelcontextmaxoverride');
         const newChanCtxAutoForget = interaction.options.getInteger('channelcontextautoforget');
-        if (newEnable === null && newCooldown === null && !newArchive && newMaxChars === null && !newModel && newEnableChanCtx === null && newChanCtxLimit === null && newDebugLog === null && newChanCtxMaxOverride === null && newChanCtxAutoForget === null) {
-          const currentCd = Math.round(TRANSFORM_THREAD_COOLDOWN_MS/1000);
-          const currentArchiveKey = CONFIG.threadAutoArchiveDuration || '24h';
-          await interaction.reply({ content: `Valeurs actuelles:\n- enableThreadTransform: ${ENABLE_THREAD_TRANSFORM}\n- transformThreadCooldownSeconds: ${currentCd}\n- threadAutoArchiveDuration: ${currentArchiveKey}\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}\n- enableChannelContext: ${ENABLE_CHANNEL_CONTEXT}\n- channelContextMessageLimit: ${CHANNEL_CONTEXT_LIMIT}\n- channelContextMaxOverride: ${CHANNEL_CONTEXT_MAX_OVERRIDE}\n- channelContextAutoForgetSeconds: ${CHANNEL_CONTEXT_AUTO_FORGET_MS/1000}\n- debugLogPrompts: ${DEBUG_LOG_PROMPTS}\n- currentModel: ${CURRENT_MODEL}\n- availableModels: ${AVAILABLE_MODELS.join(', ')}`, flags: MessageFlags.Ephemeral });
+        if (newMaxChars === null && !newModel && newEnableChanCtx === null && newChanCtxLimit === null && newDebugLog === null && newChanCtxMaxOverride === null && newChanCtxAutoForget === null) {
+          await interaction.reply({ content: `Valeurs actuelles:\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}\n- enableChannelContext: ${ENABLE_CHANNEL_CONTEXT}\n- channelContextMessageLimit: ${CHANNEL_CONTEXT_LIMIT}\n- channelContextMaxOverride: ${CHANNEL_CONTEXT_MAX_OVERRIDE}\n- channelContextAutoForgetSeconds: ${CHANNEL_CONTEXT_AUTO_FORGET_MS/1000}\n- debugLogPrompts: ${DEBUG_LOG_PROMPTS}\n- currentModel: ${CURRENT_MODEL}\n- availableModels: ${AVAILABLE_MODELS.join(', ')}` , flags: MessageFlags.Ephemeral });
           return;
         }
         const summary = [];
-        if (newEnable !== null) {
-          ENABLE_THREAD_TRANSFORM = newEnable;
-          CONFIG.enableThreadTransform = newEnable;
-          summary.push(`enableThreadTransform => ${newEnable}`);
-        }
         if (newEnableChanCtx !== null) {
           ENABLE_CHANNEL_CONTEXT = newEnableChanCtx;
           CONFIG.enableChannelContext = newEnableChanCtx;
           summary.push(`enableChannelContext => ${newEnableChanCtx}`);
-        }
-        if (typeof newCooldown === 'number') {
-          const safe = Math.max(0, newCooldown);
-            CONFIG.transformThreadCooldownSeconds = safe;
-            TRANSFORM_THREAD_COOLDOWN_MS = safe * 1000;
-            summary.push(`transformThreadCooldownSeconds => ${safe}`);
-        }
-        if (newArchive) {
-          if (setThreadAutoArchiveFromKey(newArchive)) {
-            summary.push(`threadAutoArchiveDuration => ${newArchive}`);
-          } else {
-            summary.push(`threadAutoArchiveDuration => valeur invalide (${newArchive}) ignorée`);
-          }
         }
         if (typeof newMaxChars === 'number') {
           const clamped = Math.max(500, Math.min(4000, newMaxChars));
@@ -1022,7 +787,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return; // autre commande ignorée
     }
 
-    if (!interaction.isButton()) return; // reste: boutons
+  if (!interaction.isButton()) return; // aucun bouton restant
 
     // Bloquer les utilisateurs blacklist sur les boutons aussi
     if (isUserBlacklisted(interaction.user.id)) {
@@ -1032,166 +797,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
-    // Nouveau: gestion multi-boutons
-    if (interaction.customId === 'make-thread') {
-      if (!ENABLE_THREAD_TRANSFORM) {
-        try { if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: 'La création de thread est désactivée.', flags: MessageFlags.Ephemeral }); } catch {}
-        return;
-      }
-      const sourceMessage = interaction.message;
-      const parentChannel = sourceMessage.channel;
-      // Vérification de l'âge du message (sauf pour admins)
-      const isAdminUser = isAdmin(interaction.user.id, interaction.member);
-      try {
-        if (!isAdminUser && TRANSFORM_THREAD_MAX_MESSAGE_AGE_MS > 0) {
-          const ageMs = Date.now() - (sourceMessage.createdTimestamp || 0);
-          if (ageMs > TRANSFORM_THREAD_MAX_MESSAGE_AGE_MS) {
-            if (!interaction.replied && !interaction.deferred) {
-              await interaction.reply({ content: 'Délai expiré (admins exemptés): message trop ancien pour être transformé en thread.', flags: MessageFlags.Ephemeral });
-            }
-            return;
-          }
-        }
-      } catch (e) { console.error('age check error', e); }
-      await syncThreadLock(parentChannel);
-      if (!isChannelAllowed(parentChannel)) {
-        try { if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Salon non autorisé.', flags: MessageFlags.Ephemeral }); else if (interaction.deferred) await interaction.editReply({ content: 'Salon non autorisé.', flags: MessageFlags.Ephemeral }); } catch {}
-        return;
-      }
-      try {
-        await ensureDb();
-        // Vérification cooldown global par utilisateur
-  if (!isAdminUser && TRANSFORM_THREAD_COOLDOWN_MS > 0) {
-          try {
-            const lastTs = await getLastTransformTs(interaction.user.id);
-            if (lastTs) {
-              const elapsed = Date.now() - lastTs;
-              const remain = TRANSFORM_THREAD_COOLDOWN_MS - elapsed;
-              if (remain > 0) {
-                const secs = Math.ceil(remain / 1000);
-                if (!interaction.replied && !interaction.deferred) {
-                  await interaction.reply({ content: `Cooldown actif. Réessaie dans ${secs}s.`, flags: MessageFlags.Ephemeral });
-                } else if (!interaction.replied) {
-                  await interaction.editReply({ content: `Cooldown actif (${secs}s restants).`, flags: MessageFlags.Ephemeral });
-                }
-                return; // stop
-              }
-            }
-          } catch (e) { console.error('cooldown check error', e); }
-        }
-        // Vérification unique par message
-  if (!isAdminUser && await hasUserTransformed(sourceMessage.id, interaction.user.id)) {
-          if(!interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Tu as déjà transformé ce message.', flags: MessageFlags.Ephemeral });
-          else await interaction.editReply({ content: 'Déjà transformé.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-      } catch(e){ console.error('check transform', e); }
-  // On différé directement en éphémère pour que le message final soit privé
-  try { if (!interaction.deferred && !interaction.replied) await interaction.deferReply({ flags: MessageFlags.Ephemeral }); } catch {}
-      if (!parentChannel.isTextBased()) { if (!interaction.replied) await interaction.editReply('Impossible ici'); return; }
-      if (parentChannel.isThread?.()) { if (!interaction.replied) await interaction.editReply('Déjà un thread.'); return; }
-      let originalQuestion = '';
-      if (sourceMessage.reference?.messageId) { try { const ref = await sourceMessage.fetchReference(); originalQuestion = ref?.content || ''; } catch(e){ console.error('fetchReference', e);} }
-      // La réponse peut être dans le contenu (ancienne version) ou dans un embed (nouveau mode)
-      let answerContentRaw = sourceMessage.content || '';
-      if (!answerContentRaw && Array.isArray(sourceMessage.embeds) && sourceMessage.embeds.length) {
-        const first = sourceMessage.embeds[0];
-        // On privilégie description
-        if (first?.description) answerContentRaw = first.description;
-        else if (first?.fields?.length) {
-          const fieldRep = first.fields.find(f => /réponse/i.test(f.name || ''));
-          if (fieldRep?.value) answerContentRaw = fieldRep.value;
-        }
-      }
-      const threadName = await generateThreadTitle({ question: originalQuestion || answerContentRaw, answer: answerContentRaw });
-  let thread; try { thread = await parentChannel.threads.create({ name: threadName, autoArchiveDuration: THREAD_AUTO_ARCHIVE_DURATION, reason: 'Thread IA' }); } catch(e){ console.error('create thread', e); if(!interaction.replied) await interaction.editReply('Erreur création thread'); return; }
-      const owner = interaction.user;
-  try { console.log(`[thread] transform user=${owner.tag} (${owner.id}) sourceMsg=${sourceMessage.id} -> thread=${thread?.id || '??'} name="${threadName}"`); } catch {}
-      const embed = new EmbedBuilder()
-        .setTitle('Conversation IA')
-        .setColor(0x5865F2)
-        .addFields(
-          { name: 'Message initial', value: (originalQuestion || '—').slice(0, 1024) || '—' },
-          { name: 'Réponse', value: (answerContentRaw || '—').slice(0, 1024) || '—' },
-          { name: 'Commencé par', value: `<@${owner.id}>`, inline: true }
-        )
-        .setTimestamp(new Date());
-      try { await thread.send({ embeds: [embed], components: [buildThreadControlButtons({locked:false})] }); } catch(e){ console.error('send embed', e);}    
-      try { await ensureDb(); if (originalQuestion) await addMessage(thread.id,'user',originalQuestion); await addMessage(thread.id,'assistant',answerContentRaw); await setThreadOwner(thread.id, owner.id); await recordTransform(sourceMessage.id, owner.id, thread.id); } catch(e){ console.error('seed meta', e);}    
-  // L'auto-archivage est désormais géré par la durée Discord (THREAD_AUTO_ARCHIVE_DURATION)
-      if (!interaction.replied) {
-        await interaction.editReply({ content: `Thread créé: <#${thread.id}>` });
-      } else {
-        try { await interaction.followUp({ content: `Thread créé: <#${thread.id}>`, flags: MessageFlags.Ephemeral }); } catch {}
-      }
-      return;
-    }
-
-    if (interaction.customId === 'lock-thread') {
-      if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Confirmer le verrouillage ?', components: [buildConfirmRow('lock')], flags: MessageFlags.Ephemeral });
-      return;
-    }
-    if (interaction.customId === 'close-thread') {
-      if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Confirmer la fermeture du fil ?', components: [buildConfirmRow('close')], flags: MessageFlags.Ephemeral });
-      return;
-    }
-    if (interaction.customId === 'confirm-lock') {
-      const thread = interaction.channel; if (!thread?.isThread?.()) return;
-      try { if(!interaction.deferred && !interaction.replied) await interaction.deferReply({ flags: MessageFlags.Ephemeral }); } catch {}
-      await ensureDb();
-      const meta = await getThreadMeta(thread.id);
-      const isOwner = meta && meta.owner_id === interaction.user.id;
-      const hasPerm = interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageThreads);
-      if (!isOwner && !hasPerm) { if(!interaction.replied) await interaction.editReply({ content: 'Non autorisé.' }); return; }
-      if (meta?.locked) { await interaction.editReply({ content: 'Déjà verrouillé.' }); return; }
-      try { await lockThreadMeta(thread.id); await thread.setLocked(true,'lock'); await thread.setArchived(true,'lock'); } catch(e){ console.error('lock', e);} 
-      await interaction.editReply({ content: 'Thread verrouillé.' });
-      return;
-    }
-    if (interaction.customId === 'confirm-close') {
-      const thread = interaction.channel; if (!thread?.isThread?.()) return;
-      try { if(!interaction.deferred && !interaction.replied) await interaction.deferReply({ flags: MessageFlags.Ephemeral }); } catch {}
-      const isOwner = thread.ownerId === interaction.user.id; // fallback minimal
-      const hasPerm = interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageThreads);
-      if (!isOwner && !hasPerm) { if(!interaction.replied) await interaction.editReply({ content: 'Non autorisé.' }); return; }
-      if (thread.archived) { await interaction.editReply({ content: 'Déjà fermé.' }); return; }
-      try { await thread.setArchived(true, 'close-thread'); } catch (e) { console.error('close thread', e); if(!interaction.replied) await interaction.editReply({ content: 'Erreur fermeture.' }); return; }
-      await interaction.editReply({ content: 'Fil fermé (archivé).', components: [] });
-      return;
-    }
-    if (interaction.customId === 'delete-thread') {
-      if (!interaction.replied && !interaction.deferred) await interaction.reply({ content: 'Confirmer la suppression ?', components: [buildConfirmRow('delete')], flags: MessageFlags.Ephemeral });
-      return;
-    }
-    if (interaction.customId === 'confirm-delete') {
-      const thread = interaction.channel; if (!thread?.isThread?.()) return;
-      try { if(!interaction.deferred && !interaction.replied) await interaction.deferReply({ flags: MessageFlags.Ephemeral }); } catch {}
-      await ensureDb();
-      const meta = await getThreadMeta(thread.id);
-      const isOwner = meta && meta.owner_id === interaction.user.id;
-      const hasPerm = interaction.memberPermissions?.has(PermissionsBitField.Flags.ManageThreads);
-      if (!isOwner && !hasPerm) { if(!interaction.replied) await interaction.editReply({ content: 'Non autorisé.' }); return; }
-      try { await thread.delete('Suppression par owner'); } catch(e){ console.error('delete', e); if(!interaction.replied) await interaction.editReply({ content: 'Erreur suppression.' }); return; }
-      try { if(!interaction.replied) await interaction.editReply({ content: 'Thread supprimé.' }); } catch {}
-      return;
-    }
-    if (interaction.customId === 'cancel-action') {
-      // Toujours répondre: interaction bouton fresh => update, sinon editReply
-      try {
-        if (interaction.isButton()) {
-          // update fonctionne pour un ComponentInteraction (même éphémère)
-          await interaction.update({ content: 'Action annulée.', components: [] });
-        } else if (!interaction.replied) {
-          await interaction.reply({ content: 'Action annulée.', flags: MessageFlags.Ephemeral });
-        } else {
-          await interaction.editReply({ content: 'Action annulée.', components: [] });
-        }
-      } catch (e) {
-        console.error('cancel-action error', e);
-        try { if (!interaction.replied) await interaction.reply({ content: 'Annulé.', flags: MessageFlags.Ephemeral }); } catch {}
-      }
-      return;
-    }
+  // Plus aucun bouton géré
+  return;
   } catch (e) {
     console.error('Erreur InteractionCreate', e);
     try {
