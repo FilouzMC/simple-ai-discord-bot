@@ -38,8 +38,9 @@ const DEFAULT_CONFIG = {
   currentModel: 'gemini-2.5-pro',
   enableChannelContext: true,
   channelContextMessageLimit: 6,
-  debugLogPrompts: false
-  ,channelContextMaxOverride: 20
+  debugLogPrompts: false,
+  channelContextMaxOverride: 20,
+  channelContextAutoForgetSeconds: 0
 };
 let configNeedsWrite = false;
 try {
@@ -163,6 +164,12 @@ if (CHANNEL_CONTEXT_LIMIT !== CONFIG.channelContextMessageLimit) { CONFIG.channe
 let DEBUG_LOG_PROMPTS = !!CONFIG.debugLogPrompts;
 let CHANNEL_CONTEXT_MAX_OVERRIDE = (typeof CONFIG.channelContextMaxOverride === 'number' && CONFIG.channelContextMaxOverride > 0) ? Math.min(50, CONFIG.channelContextMaxOverride) : 20;
 if (CHANNEL_CONTEXT_MAX_OVERRIDE !== CONFIG.channelContextMaxOverride) { CONFIG.channelContextMaxOverride = CHANNEL_CONTEXT_MAX_OVERRIDE; saveConfig(); }
+let CHANNEL_CONTEXT_AUTO_FORGET_MS = (typeof CONFIG.channelContextAutoForgetSeconds === 'number' && CONFIG.channelContextAutoForgetSeconds > 0)
+  ? Math.min(24*3600, CONFIG.channelContextAutoForgetSeconds) * 1000
+  : 0; // 0 = jamais auto-forget
+if ((CHANNEL_CONTEXT_AUTO_FORGET_MS/1000) !== CONFIG.channelContextAutoForgetSeconds) { CONFIG.channelContextAutoForgetSeconds = CHANNEL_CONTEXT_AUTO_FORGET_MS/1000; saveConfig(); }
+// Dernier usage par salon (timestamp ms)
+const channelLastContextUsage = new Map();
 
 async function buildChannelContext(channel, uptoMessageId, overrideLimit) {
   if (!ENABLE_CHANNEL_CONTEXT) return '';
@@ -275,6 +282,7 @@ async function registerSlashCommands() {
   .addBooleanOption(o => o.setName('enablechannelcontext').setDescription('Activer le contexte récent du salon (hors thread)'))
   .addIntegerOption(o => o.setName('channelcontextlimit').setDescription('Nb messages récents salon (1-25)').setMinValue(1).setMaxValue(25))
   .addIntegerOption(o => o.setName('channelcontextmaxoverride').setDescription('Limite max override utilisateur (1-50)').setMinValue(1).setMaxValue(50))
+  .addIntegerOption(o => o.setName('channelcontextautoforget').setDescription('Délai auto-forget contexte (sec, 0=jamais, max 86400)').setMinValue(0).setMaxValue(86400))
   .addBooleanOption(o => o.setName('debuglogprompts').setDescription('Activer log complet des prompts (attention aux données sensibles)'))
     .addStringOption(o => o
       .setName('threadautoarchiveduration')
@@ -705,7 +713,18 @@ client.on(Events.MessageCreate, async (message) => {
     // Contexte channel (uniquement hors thread)
     let channelContext = '';
     if (!threadId) {
-      try { channelContext = await buildChannelContext(message.channel, message.id, overrideContextCount); } catch {}
+      let allowContext = true;
+      if (CHANNEL_CONTEXT_AUTO_FORGET_MS > 0) {
+        const lastTs = channelLastContextUsage.get(message.channel.id) || 0;
+        const elapsed = Date.now() - lastTs;
+        if (elapsed > CHANNEL_CONTEXT_AUTO_FORGET_MS && !overrideContextCount) {
+          allowContext = false; // oublié automatiquement
+        }
+      }
+      if (allowContext) {
+        try { channelContext = await buildChannelContext(message.channel, message.id, overrideContextCount); } catch {}
+        channelLastContextUsage.set(message.channel.id, Date.now());
+      }
     }
     const answer = await generateAnswer({ threadId, userQuestion: content, channelContext });
     active = false; await typingLoop.catch(()=>{});
@@ -853,10 +872,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const newChanCtxLimit = interaction.options.getInteger('channelcontextlimit');
         const newDebugLog = interaction.options.getBoolean('debuglogprompts');
         const newChanCtxMaxOverride = interaction.options.getInteger('channelcontextmaxoverride');
-        if (newEnable === null && newCooldown === null && !newArchive && newMaxChars === null && !newModel && newEnableChanCtx === null && newChanCtxLimit === null && newDebugLog === null && newChanCtxMaxOverride === null) {
+        const newChanCtxAutoForget = interaction.options.getInteger('channelcontextautoforget');
+        if (newEnable === null && newCooldown === null && !newArchive && newMaxChars === null && !newModel && newEnableChanCtx === null && newChanCtxLimit === null && newDebugLog === null && newChanCtxMaxOverride === null && newChanCtxAutoForget === null) {
           const currentCd = Math.round(TRANSFORM_THREAD_COOLDOWN_MS/1000);
           const currentArchiveKey = CONFIG.threadAutoArchiveDuration || '24h';
-          await interaction.reply({ content: `Valeurs actuelles:\n- enableThreadTransform: ${ENABLE_THREAD_TRANSFORM}\n- transformThreadCooldownSeconds: ${currentCd}\n- threadAutoArchiveDuration: ${currentArchiveKey}\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}\n- enableChannelContext: ${ENABLE_CHANNEL_CONTEXT}\n- channelContextMessageLimit: ${CHANNEL_CONTEXT_LIMIT}\n- channelContextMaxOverride: ${CHANNEL_CONTEXT_MAX_OVERRIDE}\n- debugLogPrompts: ${DEBUG_LOG_PROMPTS}\n- currentModel: ${CURRENT_MODEL}\n- availableModels: ${AVAILABLE_MODELS.join(', ')}`, flags: MessageFlags.Ephemeral });
+          await interaction.reply({ content: `Valeurs actuelles:\n- enableThreadTransform: ${ENABLE_THREAD_TRANSFORM}\n- transformThreadCooldownSeconds: ${currentCd}\n- threadAutoArchiveDuration: ${currentArchiveKey}\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}\n- enableChannelContext: ${ENABLE_CHANNEL_CONTEXT}\n- channelContextMessageLimit: ${CHANNEL_CONTEXT_LIMIT}\n- channelContextMaxOverride: ${CHANNEL_CONTEXT_MAX_OVERRIDE}\n- channelContextAutoForgetSeconds: ${CHANNEL_CONTEXT_AUTO_FORGET_MS/1000}\n- debugLogPrompts: ${DEBUG_LOG_PROMPTS}\n- currentModel: ${CURRENT_MODEL}\n- availableModels: ${AVAILABLE_MODELS.join(', ')}`, flags: MessageFlags.Ephemeral });
           return;
         }
         const summary = [];
@@ -900,6 +920,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
           CHANNEL_CONTEXT_MAX_OVERRIDE = safe;
           CONFIG.channelContextMaxOverride = safe;
           summary.push(`channelContextMaxOverride => ${safe}` + (safe !== newChanCtxMaxOverride ? ' (ajusté)' : ''));
+        }
+        if (typeof newChanCtxAutoForget === 'number') {
+          const safeSec = Math.max(0, Math.min(86400, newChanCtxAutoForget));
+          CHANNEL_CONTEXT_AUTO_FORGET_MS = safeSec * 1000;
+          CONFIG.channelContextAutoForgetSeconds = safeSec;
+          summary.push(`channelContextAutoForgetSeconds => ${safeSec}` + (safeSec !== newChanCtxAutoForget ? ' (ajusté)' : ''));
         }
         if (newModel) {
           if (setCurrentModel(newModel)) {
