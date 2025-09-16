@@ -3,7 +3,8 @@
     "@google/generative-ai": "^0.24.1",
     "discord.js": "^14.22.1",
     "dotenv": "^17.2.2",
-    "sqlite3": "^5.1.7"
+    "sqlite3": "^5.1.7",
+    "better-sqlite3": "^11.7.0"
   },
   "name": "simple-gemini-discord-bot",
   "version": "1.0.0",

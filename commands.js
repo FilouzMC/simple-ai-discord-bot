@@ -55,6 +55,13 @@ export function buildSlashCommands() {
     .setDescription('Réinitialiser le contexte récent (admin)')
     .addBooleanOption(o=>o.setName('all').setDescription('Tout oublier (sinon seulement ce salon)'));
   cmds.push(resetCtx);
+
+  const contextCmd = new SlashCommandBuilder()
+    .setName('context')
+  .setDescription('Afficher les sujets détectés / messages d\'un sujet')
+  .addIntegerOption(o=>o.setName('subject').setDescription('ID sujet pour afficher messages'))
+  .addBooleanOption(o=>o.setName('full').setDescription('Lister tous les sujets (ignoré si subject)'));
+  cmds.push(contextCmd);
   return cmds;
 }
 

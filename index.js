@@ -3,6 +3,7 @@ import { Client, GatewayIntentBits, Partials, Events, MessageFlags } from 'disco
 import { CONFIG, AVAILABLE_MODELS, CURRENT_MODEL, setCurrentModel, SYSTEM_PROMPT, saveConfig, setSystemPrompt } from './lib/config.js';
 import { loadBlacklist, isUserBlacklisted, addBlacklist, removeBlacklist, listBlacklist } from './lib/blacklist.js';
 import { buildChannelContext } from './lib/context.js';
+import { recordMessageToSubject, buildUniversalContextForLatest, listSubjectsForDisplay } from './lib/subjects.js';
 import { generateAnswer } from './lib/ai.js';
 import { withTyping, sendAIResponse, sendAIError } from './lib/respond.js';
 import { registerSlashCommands } from './commands.js';
@@ -86,12 +87,18 @@ client.on(Events.MessageCreate, async (message) => {
       try { const ref = await message.fetchReference(); replyToBot = ref.author?.id === botId; } catch {}
     }
 
-    // AUTO RESPONSE si pas mention / reply direct
+    // Enregistrer TOUT message dans un sujet (avant toute logique de réponse)
+    const rawContentFull = (message.content || '').trim();
+    try {
+      recordMessageToSubject({ channelId: message.channel.id, authorId: message.author.id, content: rawContentFull, debug: DEBUG_MODE });
+    } catch (e) { if (DEBUG_MODE) console.log('[debug][subjects][recordError]', e.message); }
+
+    // AUTO RESPONSE (désormais basé sur contexte sujet) si pas mention / reply direct
     if (!mentioned && !replyToBot) {
       if (ENABLE_AUTO_RESPONSE) {
         try {
-          const raw = (message.content || '').trim();
-          if (DEBUG_MODE) console.log('[debug][autoResponse][incoming]', { len: raw.length, channel: message.channel.id, sample: raw.slice(0,80) });
+          const raw = rawContentFull;
+            if (DEBUG_MODE) console.log('[debug][autoResponse][incoming]', { len: raw.length, channel: message.channel.id, sample: raw.slice(0,80) });
           if (raw.length >= 25 && /[a-zA-ZÀ-ÖØ-öø-ÿ!?]/.test(raw)) {
             const now = Date.now();
             const last = lastAutoResponsePerChannel.get(message.channel.id) || 0;
@@ -100,8 +107,13 @@ client.on(Events.MessageCreate, async (message) => {
               if (Math.random() <= AUTO_RESPONSE_PROB) {
                 const answerResult = await withTyping(message.channel, async () => {
                   let miniCtx = '';
-                  try { miniCtx = await buildChannelContext({ channel: message.channel, uptoMessageId: message.id, overrideLimit: null, limit: Math.min(4, CHANNEL_CONTEXT_LIMIT), maxOverride: CHANNEL_CONTEXT_MAX_OVERRIDE, botId }); } catch {}
-                  const guidanceQuestion = `Analyse ce court échange et propose, si pertinent, un conseil ou clarification utile en UNE ou DEUX phrases maximum. Ne réponds que si tu peux réellement aider sans répéter obvious. Message le plus récent: "${raw.slice(0,280)}"`;
+                  try {
+                    miniCtx = buildUniversalContextForLatest({ channelId: message.channel.id }) || '';
+                    if (!miniCtx) {
+                      miniCtx = await buildChannelContext({ channel: message.channel, uptoMessageId: message.id, overrideLimit: null, limit: Math.min(4, CHANNEL_CONTEXT_LIMIT), maxOverride: CHANNEL_CONTEXT_MAX_OVERRIDE, botId });
+                    }
+                  } catch {}
+                  const guidanceQuestion = `Analyse le sujet courant et propose, si pertinent, un conseil ou clarification utile en UNE ou DEUX phrases maximum. Ne réponds que si tu peux apporter une vraie valeur. Dernier message: "${raw.slice(0,280)}"`;
                   return generateAnswer({ userQuestion: guidanceQuestion, channelContext: miniCtx, debug: DEBUG_MODE });
                 });
                 if (answerResult.ok) {
@@ -114,14 +126,17 @@ client.on(Events.MessageCreate, async (message) => {
               } else if (DEBUG_MODE) { console.log('[debug][autoResponse][skip] probability gate'); }
             } else if (DEBUG_MODE) { console.log('[debug][autoResponse][skip] interval', { elapsedMs: elapsed }); }
           } else if (DEBUG_MODE) { console.log('[debug][autoResponse][skip] heuristique longueur/charset'); }
-        } catch {}
+        } catch (e) { if (DEBUG_MODE) console.log('[debug][autoResponse][error]', e.message); }
       }
       return;
     }
 
-    // Question utilisateur (strip mention)
-    let userQuestion = (message.content || '').replace(new RegExp(`<@!?${botId}>`, 'g'), '').trim();
+    // Question utilisateur (strip mention) + enregistrement sujet
+    let rawContent = (message.content || '').trim();
+    let userQuestion = rawContent.replace(new RegExp(`<@!?${botId}>`, 'g'), '').trim();
     if (!userQuestion) userQuestion = '(Message vide)';
+
+  // (Déjà enregistré plus haut pour tous les messages)
 
     if (DEBUG_MODE) {
       console.log('[debug][trigger]', {
@@ -134,7 +149,7 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     const answerResult = await withTyping(message.channel, async () => {
-      // Contexte
+      // Contexte (universel sujets prioritaire sinon fallback channel)
       let channelContext = '';
       let allowContext = true;
       if (CHANNEL_CONTEXT_AUTO_FORGET_MS > 0) {
@@ -143,14 +158,18 @@ client.on(Events.MessageCreate, async (message) => {
       }
       if (allowContext && ENABLE_CHANNEL_CONTEXT) {
         try {
-          channelContext = await buildChannelContext({
-            channel: message.channel,
-            uptoMessageId: message.id,
-            overrideLimit: null,
-            limit: CHANNEL_CONTEXT_LIMIT,
-            maxOverride: CHANNEL_CONTEXT_MAX_OVERRIDE,
-            botId
-          });
+          // Essayer universel
+          channelContext = buildUniversalContextForLatest({ channelId: message.channel.id }) || '';
+          if (!channelContext) {
+            channelContext = await buildChannelContext({
+              channel: message.channel,
+              uptoMessageId: message.id,
+              overrideLimit: null,
+              limit: CHANNEL_CONTEXT_LIMIT,
+              maxOverride: CHANNEL_CONTEXT_MAX_OVERRIDE,
+              botId
+            });
+          }
           channelLastContextUsage.set(message.channel.id, Date.now());
         } catch (e) { if (DEBUG_MODE) console.log('[debug][context][error]', e); }
       }
@@ -393,7 +412,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           return;
         }
       }
-      if (interaction.commandName === 'resetcontext') {
+  if (interaction.commandName === 'resetcontext') {
         if (!isAdmin(interaction.user.id, interaction.member)) {
           await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
           return;
@@ -409,6 +428,17 @@ client.on(Events.InteractionCreate, async (interaction) => {
           if (lastAutoResponsePerChannel.delete(interaction.channelId)) cleared++;
         }
         await interaction.reply({ content: `Contexte réinitialisé (${all?'global':'salon'}) – entrées effacées: ${cleared}.`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (interaction.commandName === 'context') {
+        const subjects = listSubjectsForDisplay(interaction.channelId, 12);
+        if (!subjects.length) {
+          await interaction.reply({ content: 'Aucun sujet détecté encore.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        const lines = subjects.map(s => `#${s.id} • ${s.title} • ${s.count} msgs\nMots-clés: ${s.keywords || '-'}\nRésumé: ${s.summary}`);
+        const txt = lines.join('\n\n').slice(0, 1800);
+        await interaction.reply({ content: txt, flags: MessageFlags.Ephemeral });
         return;
       }
       return; // autre commande ignorée
