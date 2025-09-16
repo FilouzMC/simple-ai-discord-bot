@@ -30,7 +30,10 @@ export function buildSlashCommands() {
     .addIntegerOption(o=>o.setName('channelcontextlimit').setDescription('Nb msgs récents (1-25)').setMinValue(1).setMaxValue(25))
     .addIntegerOption(o=>o.setName('channelcontextmaxoverride').setDescription('Limite override (1-50)').setMinValue(1).setMaxValue(50))
     .addIntegerOption(o=>o.setName('channelcontextautoforget').setDescription('Auto-forget (sec,0=jamais)').setMinValue(0).setMaxValue(86400))
-    .addBooleanOption(o=>o.setName('debuglogprompts').setDescription('Log complet prompts'));
+  .addBooleanOption(o=>o.setName('debug').setDescription('Mode debug (logs détaillés)'))
+  .addBooleanOption(o=>o.setName('enableautoresponse').setDescription('Activer réponses automatiques pertinentes'))
+  .addIntegerOption(o=>o.setName('autoresponseinterval').setDescription('Intervalle min auto (sec, 30-3600)').setMinValue(30).setMaxValue(3600))
+  .addNumberOption(o=>o.setName('autoresponseprobability').setDescription('Proba tentative (0-1 ex:0.3)').setMinValue(0).setMaxValue(1));
   cmds.push(optionsCmd);
 
   const opCmd = new SlashCommandBuilder()
@@ -46,6 +49,12 @@ export function buildSlashCommands() {
     .addSubcommand(sc=>sc.setName('remove').setDescription('Retirer un salon').addChannelOption(o=>o.setName('salon').setDescription('Salon texte').addChannelTypes(ChannelType.GuildText).setRequired(true)))
     .addSubcommand(sc=>sc.setName('list').setDescription('Lister les salons whitelists'));
   cmds.push(wlCmd);
+
+  const resetCtx = new SlashCommandBuilder()
+    .setName('resetcontext')
+    .setDescription('Réinitialiser le contexte récent (admin)')
+    .addBooleanOption(o=>o.setName('all').setDescription('Tout oublier (sinon seulement ce salon)'));
+  cmds.push(resetCtx);
   return cmds;
 }
 
