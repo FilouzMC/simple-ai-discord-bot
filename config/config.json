@@ -15,7 +15,7 @@
     "sonar",
     "gemini-2.5-flash"
   ],
-  "currentModel": "gemini-2.5-flash",
+  "currentModel": "sonar",
   "enableChannelContext": true,
   "channelContextMessageLimit": 6,
   "channelContextThreadMessageLimit": 30,
@@ -28,11 +28,15 @@
     "🎯 Précis": ["gemini-2.5-pro"],
     "🔍 Recherche": ["sonar"]
   },
+  "autoModel": {
+    "enabled": true,
+    "fallbackModels": ["sonar", "gemini-2.5-flash", "gemini-2.5-pro"]
+  },
   "channelContextMessageMaxAgeSeconds": 3600,
   "autoSummaryEnabled": false,
   "autoSummaryIdleSeconds": 1800,
   "autoSummaryMinMessages": 15,
-  "autoSummaryPrompt": "Tu es un assistant qui résume de manière structurée un débat sur Discord. Fournis: 1) Contexte global, 2) Points clés (puces), 3) Convergences, 4) Divergences, 5) Actions / décisions, 6) Questions ouvertes. Reste concis.",
+  "autoSummaryPrompt": "Tu es un assistant qui résume de manière structurée un débat sur Discord. Fournis: 1) Contexte global, 2) Points clés (puces), 3) Convergences, 4) Divergences. Reste concis.",
   "autoSummaryContextLimit": 80,
   "channelPrompts": {},
   "modelRateLimits": {}

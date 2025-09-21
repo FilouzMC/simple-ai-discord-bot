@@ -3,7 +3,7 @@ import { Client, GatewayIntentBits, Partials, Events, MessageFlags } from 'disco
 import { CONFIG, AVAILABLE_MODELS, CURRENT_MODEL, setCurrentModel, SYSTEM_PROMPT, saveConfig, setSystemPrompt, getChannelPrompt, setChannelPrompt, clearChannelPrompt, listChannelPrompts, getModelRateLimit, listModelRateLimits, setModelRateLimit, clearModelRateLimit } from './lib/config.js';
 import { loadBlacklist, isUserBlacklisted, addBlacklist, removeBlacklist, listBlacklist } from './lib/blacklist.js';
 import { buildChannelContext } from './lib/context.js';
-import { generateAnswer } from './lib/ai.js';
+import { generateAnswer, generateAnswerWithFallback } from './lib/ai.js';
 import { withTyping, sendAIResponse, sendAIError, buildAIEmbeds } from './lib/respond.js';
 import { registerSlashCommands } from './commands.js';
 import fs from 'node:fs';
@@ -103,10 +103,15 @@ async function runChannelSummary(channel,{forced}){
       const answerResult = await withTyping(channel, async ()=>{
         const rateCheck=checkAndRegisterModelUse(AUTO_SUMMARY_MODEL || CURRENT_MODEL);
         if(!rateCheck.ok) return { ok:false, error:rateCheck.reason, ms:0 };
-        return generateAnswer({ userQuestion, channelContext:'', debug:DEBUG_MODE, systemPromptOverride:null, modelOverride:AUTO_SUMMARY_MODEL });
+        if (AUTO_SUMMARY_MODEL) {
+          return generateAnswer({ userQuestion, channelContext:'', debug:DEBUG_MODE, systemPromptOverride:null, modelOverride:AUTO_SUMMARY_MODEL });
+        } else {
+          return generateAnswerWithFallback({ userQuestion, channelContext:'', debug:DEBUG_MODE, systemPromptOverride:null });
+        }
       });
       if(!answerResult.ok){ if(DEBUG_MODE) console.log('[autosummary][fail]', answerResult.error); return; }
-      await sendAIResponse({ channel, text:answerResult.text, ms:answerResult.ms, model:AUTO_SUMMARY_MODEL, maxChars:MAX_ANSWER_CHARS, debug:DEBUG_MODE });
+      const modelUsed = answerResult.modelUsed || AUTO_SUMMARY_MODEL || CURRENT_MODEL;
+      await sendAIResponse({ channel, text:answerResult.text, ms:answerResult.ms, model:modelUsed, maxChars:MAX_ANSWER_CHARS, debug:DEBUG_MODE });
     } else {
       const text = `${AUTO_SUMMARY_PROMPT}\n\n${channelContext}`;
       await withTyping(channel, async () => {
@@ -191,14 +196,28 @@ client.on(Events.MessageCreate, async (message) => {
         } catch(e){ if (DEBUG_MODE) console.log('[debug][context][error]', e); }
       }
       const channelPrompt = getChannelPrompt(message.channel.id);
-      return generateAnswer({ userQuestion, channelContext, debug: DEBUG_MODE, systemPromptOverride: channelPrompt });
+      return generateAnswerWithFallback({ userQuestion, channelContext, debug: DEBUG_MODE, systemPromptOverride: channelPrompt });
     });
 
     if (!answerResult.ok) {
-      await sendAIError({ channel: message.channel, error: answerResult.error, ms: answerResult.ms, model: CURRENT_MODEL });
+      await sendAIError({ channel: message.channel, error: answerResult.error, ms: answerResult.ms, model: answerResult.modelUsed || CURRENT_MODEL });
       return;
     }
-    await sendAIResponse({ channel: message.channel, text: answerResult.text, ms: answerResult.ms, model: CURRENT_MODEL, maxChars: MAX_ANSWER_CHARS, debug: DEBUG_MODE });
+    
+    // Si autoModel a été utilisé, ajouter une note dans la réponse
+    let responseText = answerResult.text;
+    if (answerResult.autoModelUsed && DEBUG_MODE) {
+      responseText = `*[Auto-fallback: ${answerResult.modelUsed} utilisé après ${answerResult.attemptCount} tentative(s)]*\n\n${responseText}`;
+    }
+    
+    await sendAIResponse({ 
+      channel: message.channel, 
+      text: responseText, 
+      ms: answerResult.ms, 
+      model: answerResult.modelUsed || CURRENT_MODEL, 
+      maxChars: MAX_ANSWER_CHARS, 
+      debug: DEBUG_MODE 
+    });
   } catch (err) {
     console.error('Erreur messageCreate', err);
     try { await message.reply({ content: 'Erreur interne.', allowedMentions: { repliedUser: false } }); } catch {}
@@ -260,12 +279,34 @@ client.on(Events.InteractionCreate, async (interaction) => {
             const channelPrompt = getChannelPrompt(interaction.channel.id);
             const rateCheck = checkAndRegisterModelUse(chosenModel);
             if (!rateCheck.ok) return { ok:false, error: rateCheck.reason, ms:0 };
-            return generateAnswer({ userQuestion: question, channelContext, debug: DEBUG_MODE, modelOverride: chosenModel, systemPromptOverride: channelPrompt });
+            
+            // Utiliser generateAnswerWithFallback seulement si aucun modèle spécifique n'est choisi
+            if (modelOpt && AVAILABLE_MODELS.includes(modelOpt)) {
+              return generateAnswer({ userQuestion: question, channelContext, debug: DEBUG_MODE, modelOverride: chosenModel, systemPromptOverride: channelPrompt });
+            } else {
+              return generateAnswerWithFallback({ userQuestion: question, channelContext, debug: DEBUG_MODE, systemPromptOverride: channelPrompt });
+            }
           });
           if (!answerResult.ok) {
             await interaction.editReply({ content: `Erreur: ${answerResult.error}` });
           } else {
-            const embeds = buildAIEmbeds({ client: interaction.client, text: answerResult.text, model: chosenModel, maxChars: MAX_ANSWER_CHARS, debug: DEBUG_MODE, ms: answerResult.ms });
+            // Ajuster le modèle utilisé pour l'affichage
+            const modelUsed = answerResult.modelUsed || chosenModel;
+            
+            // Si autoModel a été utilisé, ajouter une note dans la réponse
+            let responseText = answerResult.text;
+            if (answerResult.autoModelUsed && DEBUG_MODE) {
+              responseText = `*[Auto-fallback: ${modelUsed} utilisé après ${answerResult.attemptCount} tentative(s)]*\n\n${responseText}`;
+            }
+            
+            const embeds = buildAIEmbeds({ 
+              client: interaction.client, 
+              text: responseText, 
+              model: modelUsed, 
+              maxChars: MAX_ANSWER_CHARS, 
+              debug: DEBUG_MODE, 
+              ms: answerResult.ms 
+            });
             await interaction.editReply({ embeds });
           }
         } catch (e) {
