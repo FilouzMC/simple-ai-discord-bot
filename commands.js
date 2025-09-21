@@ -33,7 +33,13 @@ export function buildSlashCommands() {
     .addIntegerOption(o=>o.setName('channelcontextautoforget').setDescription('Auto-forget (sec,0=jamais)').setMinValue(0).setMaxValue(86400))
   .addIntegerOption(o=>o.setName('channelcontextmaxage').setDescription('Âge max messages contexte (sec, 60-86400)').setMinValue(60).setMaxValue(86400))
   .addBooleanOption(o=>o.setName('debug').setDescription('Mode debug (logs détaillés)'))
-  .addBooleanOption(o=>o.setName('requiremention').setDescription('Exiger une mention ou reply pour répondre'))
+  .addBooleanOption(o=>o.setName('autosummaryenabled').setDescription('Activer l\'auto résumé'))
+  .addIntegerOption(o=>o.setName('autosummaryidleseconds').setDescription('Inactivité avant résumé (sec)').setMinValue(60).setMaxValue(10800))
+  .addIntegerOption(o=>o.setName('autosummaryminmessages').setDescription('Nb min messages avant résumé').setMinValue(3).setMaxValue(500))
+  .addIntegerOption(o=>o.setName('autosummarycontextlimit').setDescription('Nb msgs max contexte pour résumé').setMinValue(10).setMaxValue(200))
+  .addStringOption(o=>o.setName('resumesetprompt').setDescription('Définir prompt résumé').setMaxLength(3000))
+  .addBooleanOption(o=>o.setName('showresumeprompt').setDescription('Afficher prompt résumé actuel'))
+  .addStringOption(o=>o.setName('autosummarymodel').setDescription('Modèle IA pour /resume (vide = aucun)'))
   // (options autoResponse supprimées)
   ;
   cmds.push(optionsCmd);
@@ -87,6 +93,12 @@ export function buildSlashCommands() {
   .addBooleanOption(o=>o.setName('usecontext').setDescription('Inclure contexte récent du salon'))
   .addBooleanOption(o=>o.setName('public').setDescription('Rendre visible à tout le monde (sinon seulement toi)'));
   cmds.push(askCmd);
+
+  // Commande pour forcer un résumé (admin)
+  const forceResume = new SlashCommandBuilder()
+    .setName('forceresume')
+    .setDescription('Forcer la génération d\'un résumé (admin)');
+  cmds.push(forceResume);
   return cmds;
 }
 

@@ -1,7 +1,9 @@
 {
   "guildId": "955492590772449381",
   "whitelistChannelIds": [],
-  "whitelistAdminUserIds": ["317718119965523980"],
+  "whitelistAdminUserIds": [
+    "317718119965523980"
+  ],
   "whitelistAdminRoleIds": [
     "1416023614834085918"
   ],
@@ -20,10 +22,16 @@
   "debug": true,
   "channelContextMaxOverride": 20,
   "channelContextAutoForgetSeconds": 0,
-  "requireMentionOrReply": false,
+  "requireMentionOrReply": true,
   "modelGroups": {},
   "channelContextMessageMaxAgeSeconds": 3600,
+  "autoSummaryEnabled": false,
+  "autoSummaryIdleSeconds": 1800,
+  "autoSummaryMinMessages": 15,
+  "autoSummaryPrompt": "Tu es un assistant qui résume de manière structurée un débat sur Discord. Fournis: 1) Contexte global, 2) Points clés (puces), 3) Convergences, 4) Divergences, 5) Actions / décisions, 6) Questions ouvertes. Reste concis.",
+  "autoSummaryContextLimit": 80,
   "channelPrompts": {
     "1412773577706442802": "finir des phrases par caca"
-  }
+  },
+  "modelRateLimits": {}
 }
