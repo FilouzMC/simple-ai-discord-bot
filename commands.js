@@ -24,8 +24,8 @@ export function buildSlashCommands() {
   const optionsCmd = new SlashCommandBuilder()
     .setName('options')
     .setDescription('Met à jour des options IA (admin)')
-    .addIntegerOption(o=>o.setName('maxanswerchars').setDescription('Taille max (500-4000)').setMinValue(500).setMaxValue(4000))
-    .addStringOption(o=>{ o.setName('model').setDescription('Changer modèle'); AVAILABLE_MODELS.forEach(m=>o.addChoices({ name:m, value:m })); return o; })
+  .addIntegerOption(o=>o.setName('maxanswerchars').setDescription('Taille max (500-4000)').setMinValue(500).setMaxValue(4000))
+  .addStringOption(o=> o.setName('model').setDescription('Changer modèle (texte libre)'))
     .addBooleanOption(o=>o.setName('enablechannelcontext').setDescription('Activer contexte salon'))
     .addIntegerOption(o=>o.setName('channelcontextlimit').setDescription('Nb msgs récents (1-25)').setMinValue(1).setMaxValue(25))
   .addIntegerOption(o=>o.setName('channelcontextthreadlimit').setDescription('Nb msgs threads/forums (1-100)').setMinValue(1).setMaxValue(100))
@@ -58,12 +58,22 @@ export function buildSlashCommands() {
     .addBooleanOption(o=>o.setName('all').setDescription('Tout oublier (sinon seulement ce salon)'));
   cmds.push(resetCtx);
 
+  // Commande channelprompt (admin)
+  const chPrompt = new SlashCommandBuilder()
+    .setName('channelprompt')
+    .setDescription('Gérer le prompt spécifique du salon (admin)')
+    .addSubcommand(sc=>sc.setName('show').setDescription('Afficher le prompt de ce salon'))
+    .addSubcommand(sc=>sc.setName('set').setDescription('Définir le prompt de ce salon').addStringOption(o=>o.setName('texte').setDescription('Texte du prompt').setRequired(true).setMaxLength(3000)))
+    .addSubcommand(sc=>sc.setName('clear').setDescription('Supprimer le prompt de ce salon'))
+    .addSubcommand(sc=>sc.setName('list').setDescription('Lister les salons ayant un prompt (id + longueur)'));
+  cmds.push(chPrompt);
+
   // Commande /ask (question directe sans mention obligatoire)
   const askCmd = new SlashCommandBuilder()
     .setName('ask')
     .setDescription('Poser une question à l\'IA')
     .addStringOption(o=>o.setName('texte').setDescription('Question à poser').setRequired(true).setMaxLength(4000))
-  .addStringOption(o=>{ o.setName('model').setDescription('Modèle (facultatif)'); AVAILABLE_MODELS.forEach(m=>o.addChoices({ name:m, value:m })); return o; })
+  .addStringOption(o=> o.setName('model').setDescription('Modèle (facultatif, texte libre)'))
   .addBooleanOption(o=>o.setName('usecontext').setDescription('Inclure contexte récent du salon'))
   .addBooleanOption(o=>o.setName('public').setDescription('Rendre visible à tout le monde (sinon seulement toi)'));
   cmds.push(askCmd);

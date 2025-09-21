@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { Client, GatewayIntentBits, Partials, Events, MessageFlags } from 'discord.js';
-import { CONFIG, AVAILABLE_MODELS, CURRENT_MODEL, setCurrentModel, SYSTEM_PROMPT, saveConfig, setSystemPrompt } from './lib/config.js';
+import { CONFIG, AVAILABLE_MODELS, CURRENT_MODEL, setCurrentModel, SYSTEM_PROMPT, saveConfig, setSystemPrompt, getChannelPrompt, setChannelPrompt, clearChannelPrompt, listChannelPrompts } from './lib/config.js';
 import { loadBlacklist, isUserBlacklisted, addBlacklist, removeBlacklist, listBlacklist } from './lib/blacklist.js';
 import { buildChannelContext } from './lib/context.js';
 import { generateAnswer } from './lib/ai.js';
@@ -81,13 +81,8 @@ client.on(Events.MessageCreate, async (message) => {
 
     const botId = client.user.id;
     const mentioned = message.mentions.has(botId);
-    let replyToBot = false;
-    if (message.reference?.messageId) {
-      try { const ref = await message.fetchReference(); replyToBot = ref.author?.id === botId; } catch {}
-    }
-
-  // Option require mention ou reply
-  if (REQUIRE_MENTION_OR_REPLY && !mentioned && !replyToBot) return;
+  // Nouvelle logique: si option active on exige la mention explicite uniquement (les replies seules ne déclenchent plus)
+  if (REQUIRE_MENTION_OR_REPLY && !mentioned) return;
 
     // Question utilisateur (strip mention)
     let userQuestion = (message.content || '').replace(new RegExp(`<@!?${botId}>`, 'g'), '').trim();
@@ -126,7 +121,8 @@ client.on(Events.MessageCreate, async (message) => {
           channelLastContextUsage.set(message.channel.id, Date.now());
         } catch (e) { if (DEBUG_MODE) console.log('[debug][context][error]', e); }
       }
-      return generateAnswer({ userQuestion, channelContext, debug: DEBUG_MODE });
+  const channelPrompt = getChannelPrompt(message.channel.id);
+  return generateAnswer({ userQuestion, channelContext, debug: DEBUG_MODE, systemPromptOverride: channelPrompt });
     });
 
     if (!answerResult.ok) {
@@ -177,7 +173,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
               });
             } catch (e) { if (DEBUG_MODE) console.log('[debug][ask][context][error]', e); }
           }
-          return generateAnswer({ userQuestion: question, channelContext, debug: DEBUG_MODE, modelOverride: chosenModel });
+          const channelPrompt = getChannelPrompt(interaction.channel.id);
+          return generateAnswer({ userQuestion: question, channelContext, debug: DEBUG_MODE, modelOverride: chosenModel, systemPromptOverride: channelPrompt });
         });
         if (!answerResult.ok) {
           await interaction.editReply({ content: `Erreur: ${answerResult.error}` });
@@ -243,6 +240,45 @@ client.on(Events.InteractionCreate, async (interaction) => {
           setSystemPrompt(texte);
           await interaction.reply({ content: 'Prompt système mis à jour.', flags: MessageFlags.Ephemeral });
           return;
+        }
+        await interaction.reply({ content: 'Sous-commande inconnue.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (interaction.commandName === 'channelprompt') {
+        if (!isAdmin(interaction.user.id, interaction.member)) {
+          await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        let sub = '';
+        try { sub = interaction.options.getSubcommand(); } catch {}
+        if (sub === 'show') {
+          const cp = getChannelPrompt(interaction.channel.id);
+          if (!cp) { await interaction.reply({ content: 'Aucun prompt défini pour ce salon.', flags: MessageFlags.Ephemeral }); return; }
+          const display = cp.length > 1800 ? cp.slice(0,1800) + '…' : cp;
+          await interaction.reply({ content: `Prompt salon (${cp.length} chars):\n${display}`, flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (sub === 'set') {
+          const texte = interaction.options.getString('texte', true).trim();
+          if (!texte) { await interaction.reply({ content: 'Prompt vide.', flags: MessageFlags.Ephemeral }); return; }
+          setChannelPrompt(interaction.channel.id, texte);
+          await interaction.reply({ content: 'Prompt salon enregistré.', flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (sub === 'clear') {
+          if (clearChannelPrompt(interaction.channel.id)) {
+            await interaction.reply({ content: 'Prompt salon supprimé.', flags: MessageFlags.Ephemeral });
+          } else {
+            await interaction.reply({ content: 'Aucun prompt à supprimer.', flags: MessageFlags.Ephemeral });
+          }
+          return;
+        }
+        if (sub === 'list') {
+          const list = listChannelPrompts();
+          if (!list.length) { await interaction.reply({ content: 'Aucun salon avec prompt.', flags: MessageFlags.Ephemeral }); return; }
+            const lines = list.slice(0,50).map(e=>`<#${e.channelId}> (${e.channelId}) : ${e.length} chars`);
+            await interaction.reply({ content: `Prompts salons (${list.length}):\n${lines.join('\n')}`, flags: MessageFlags.Ephemeral });
+            return;
         }
         await interaction.reply({ content: 'Sous-commande inconnue.', flags: MessageFlags.Ephemeral });
         return;
