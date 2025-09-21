@@ -23,15 +23,17 @@
   "channelContextMaxOverride": 20,
   "channelContextAutoForgetSeconds": 0,
   "requireMentionOrReply": true,
-  "modelGroups": {},
+  "AskModel": {
+    "🚀 Rapide": ["gemini-2.5-flash"],
+    "🎯 Précis": ["gemini-2.5-pro"],
+    "🔍 Recherche": ["sonar"]
+  },
   "channelContextMessageMaxAgeSeconds": 3600,
   "autoSummaryEnabled": false,
   "autoSummaryIdleSeconds": 1800,
   "autoSummaryMinMessages": 15,
   "autoSummaryPrompt": "Tu es un assistant qui résume de manière structurée un débat sur Discord. Fournis: 1) Contexte global, 2) Points clés (puces), 3) Convergences, 4) Divergences, 5) Actions / décisions, 6) Questions ouvertes. Reste concis.",
   "autoSummaryContextLimit": 80,
-  "channelPrompts": {
-    "1412773577706442802": "finir des phrases par caca"
-  },
+  "channelPrompts": {},
   "modelRateLimits": {}
 }

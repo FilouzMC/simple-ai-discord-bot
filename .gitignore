@@ -1,5 +1,6 @@
 # Node
 node_modules/
+config/
 package-lock.json
 npm-debug.log*
 yarn.lock
@@ -22,5 +23,3 @@ logs/
 .DS_Store
 
 # JSON
-blacklist.json
-config.json

@@ -2,6 +2,39 @@ import { REST, Routes, SlashCommandBuilder, ChannelType } from 'discord.js';
 import { CONFIG, AVAILABLE_MODELS, CURRENT_MODEL, setCurrentModel, saveConfig } from './lib/config.js';
 import { addBlacklist, removeBlacklist, isUserBlacklisted, listBlacklist } from './lib/blacklist.js';
 
+// Fonction helper pour générer les choix de modèles pour la commande /ask
+function getAskModelChoices() {
+  const choices = [];
+  
+  // Si AskModel est configuré, créer des choix basés sur les groupes
+  if (CONFIG.AskModel && typeof CONFIG.AskModel === 'object') {
+    for (const [groupName, models] of Object.entries(CONFIG.AskModel)) {
+      if (Array.isArray(models) && models.length > 0) {
+        // Prendre le premier modèle du groupe comme représentant
+        const primaryModel = models.find(m => AVAILABLE_MODELS.includes(m));
+        if (primaryModel) {
+          choices.push({
+            name: groupName,
+            value: primaryModel
+          });
+        }
+      }
+    }
+  }
+  
+  // Si aucun choix n'a été généré, utiliser les modèles disponibles directement
+  if (choices.length === 0) {
+    for (const model of AVAILABLE_MODELS.slice(0, 25)) { // Discord limite à 25 choix
+      choices.push({
+        name: model,
+        value: model
+      });
+    }
+  }
+  
+  return choices.slice(0, 25); // Assurer qu'on ne dépasse pas la limite Discord
+}
+
 export function buildSlashCommands() {
   const cmds = [];
   const blacklistCmd = new SlashCommandBuilder()
@@ -85,12 +118,26 @@ export function buildSlashCommands() {
   cmds.push(modelRate);
 
   // Commande /ask (question directe sans mention obligatoire)
+  const askModelChoices = getAskModelChoices();
   const askCmd = new SlashCommandBuilder()
     .setName('ask')
     .setDescription('Poser une question à l\'IA')
-    .addStringOption(o=>o.setName('texte').setDescription('Question à poser').setRequired(true).setMaxLength(4000))
-  .addStringOption(o=> o.setName('model').setDescription('Modèle (facultatif, texte libre)'))
-  .addBooleanOption(o=>o.setName('usecontext').setDescription('Inclure contexte récent du salon'))
+    .addStringOption(o=>o.setName('texte').setDescription('Question à poser').setRequired(true).setMaxLength(4000));
+  
+  // Ajouter l'option model avec des choix si disponibles
+  if (askModelChoices.length > 0) {
+    askCmd.addStringOption(o => {
+      const option = o.setName('model').setDescription('Modèle IA à utiliser');
+      for (const choice of askModelChoices) {
+        option.addChoices(choice);
+      }
+      return option;
+    });
+  } else {
+    askCmd.addStringOption(o => o.setName('model').setDescription('Modèle (facultatif, texte libre)'));
+  }
+  
+  askCmd.addBooleanOption(o=>o.setName('usecontext').setDescription('Inclure contexte récent du salon'))
   .addBooleanOption(o=>o.setName('public').setDescription('Rendre visible à tout le monde (sinon seulement toi)'));
   cmds.push(askCmd);
 
