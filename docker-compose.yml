@@ -1,7 +1,7 @@
 services:
   bot:
-    image: simple-gemini-discord-bot:latest
-    container_name: simple-gemini-discord-bot
+    image: simple-ai-discord-bot:latest
+    container_name: simple-ai-discord-bot
     restart: unless-stopped
     environment:
       - DISCORD_TOKEN=${DISCORD_TOKEN}

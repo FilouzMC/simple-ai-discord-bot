@@ -5,7 +5,7 @@
     "dotenv": "^17.2.2",
     "sqlite3": "^5.1.7"
   },
-  "name": "simple-gemini-discord-bot",
+  "name": "simple-ai-discord-bot",
   "version": "1.0.0",
   "description": "Bot Discord (2025) utilisant Google Gemini + mémoire de conversation par thread via SQLite.",
   "main": "index.js",
