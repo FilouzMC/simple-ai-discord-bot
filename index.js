@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { Client, GatewayIntentBits, Partials, Events, MessageFlags } from 'discord.js';
-import { CONFIG, AVAILABLE_MODELS, CURRENT_MODEL, setCurrentModel, SYSTEM_PROMPT, saveConfig, setSystemPrompt, getChannelPrompt, setChannelPrompt, clearChannelPrompt, listChannelPrompts } from './lib/config.js';
+import { CONFIG, AVAILABLE_MODELS, CURRENT_MODEL, setCurrentModel, SYSTEM_PROMPT, saveConfig, setSystemPrompt, getChannelPrompt, setChannelPrompt, clearChannelPrompt, listChannelPrompts, getModelRateLimit, listModelRateLimits, setModelRateLimit, clearModelRateLimit } from './lib/config.js';
 import { loadBlacklist, isUserBlacklisted, addBlacklist, removeBlacklist, listBlacklist } from './lib/blacklist.js';
 import { buildChannelContext } from './lib/context.js';
 import { generateAnswer } from './lib/ai.js';
@@ -47,11 +47,47 @@ if (REQUIRE_MENTION_OR_REPLY !== CONFIG.requireMentionOrReply) { CONFIG.requireM
 
 // --- Etats mémoire ---
 const channelLastContextUsage = new Map();
+// Rate limit mémoire: par modèle -> { lastCallTs:number, window: [ timestamps des calls dernière heure ] }
+const modelUsage = new Map();
+
+function checkAndRegisterModelUse(model) {
+  const cfg = getModelRateLimit(model) || {};
+  const cooldownMs = (cfg.cooldownSeconds||0)*1000;
+  const maxPerHour = cfg.maxPerHour||0;
+  let entry = modelUsage.get(model);
+  const now = Date.now();
+  if (!entry) { entry = { lastCallTs:0, window:[] }; modelUsage.set(model, entry); }
+  // Cooldown
+  if (cooldownMs > 0 && entry.lastCallTs && (now - entry.lastCallTs) < cooldownMs) {
+    const wait = Math.ceil((cooldownMs - (now - entry.lastCallTs))/1000);
+    return { ok:false, reason:`Cooldown actif (${wait}s restants)` };
+  }
+  // Fenêtre 1h
+  if (maxPerHour > 0) {
+    entry.window = entry.window.filter(ts => (now - ts) < 3600_000);
+    if (entry.window.length >= maxPerHour) {
+      return { ok:false, reason:`Limite horaire atteinte (${maxPerHour}/h)` };
+    }
+  }
+  // Enregistrer
+  entry.lastCallTs = now;
+  entry.window.push(now);
+  return { ok:true };
+}
 
 // --- Helpers ---
-function isAdmin(userId, member) {
+async function isAdmin(userId, member, guild) {
   if (ADMIN_USER_IDS.includes(userId)) return true;
-  try { if (member && member.roles && member.roles.cache) { if (ADMIN_ROLE_IDS.some(r => member.roles.cache.has(r))) return true; } } catch {}
+  try {
+    let rolesCache = member?.roles?.cache;
+    if ((!rolesCache || !rolesCache.size) && guild) {
+      // tenter de récupérer le membre complet (si partial)
+      try { const fresh = await guild.members.fetch(userId); rolesCache = fresh.roles.cache; } catch {}
+    }
+    if (rolesCache && rolesCache.size) {
+      if (ADMIN_ROLE_IDS.some(r => rolesCache.has(r))) return true;
+    }
+  } catch (e) { if (DEBUG_MODE) console.log('[debug][isAdmin][error]', e?.message); }
   return false;
 }
 
@@ -60,7 +96,8 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
+  GatewayIntentBits.MessageContent,
+  GatewayIntentBits.GuildMembers
   ],
   partials: [Partials.Channel]
 });
@@ -99,6 +136,11 @@ client.on(Events.MessageCreate, async (message) => {
     }
 
     const answerResult = await withTyping(message.channel, async () => {
+      // Rate limit modèle courant
+      const rateCheck = checkAndRegisterModelUse(CURRENT_MODEL);
+      if (!rateCheck.ok) {
+        return { ok:false, error: rateCheck.reason, ms:0 };
+      }
       // Contexte
       let channelContext = '';
       let allowContext = true;
@@ -140,98 +182,104 @@ client.on(Events.MessageCreate, async (message) => {
 // --- InteractionCreate (slash commands) ---
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
-    // Slash command blacklist
-    if (interaction.isChatInputCommand()) {
-  // Log exécution commande (avant permission pour audit)
-  let subName = ''; try { subName = interaction.options.getSubcommand(); } catch {}
-  try { console.log(`[slash] cmd=/${interaction.commandName}${subName?` sub=${subName}`:''} user=${interaction.user.tag} (${interaction.user.id})`); } catch {}
-    if (interaction.commandName === 'ask') {
-      const question = interaction.options.getString('texte', true).trim();
-      const modelOpt = interaction.options.getString('model');
-      const publicFlag = interaction.options.getBoolean('public') || false;
-      const useContext = interaction.options.getBoolean('usecontext') || false;
-  // Cohérence contexte: on réutilise exactement buildChannelContext avec mêmes limites
-  // que pour un ping (CHANNEL_CONTEXT_LIMIT, CHANNEL_CONTEXT_MAX_OVERRIDE).
-  // Pour une interaction slash, pas de message déclencheur -> uptoMessageId:null.
-      let chosenModel = CURRENT_MODEL;
-      if (modelOpt && AVAILABLE_MODELS.includes(modelOpt)) chosenModel = modelOpt;
-      await interaction.deferReply({ ephemeral: !publicFlag });
+    if (!interaction.isChatInputCommand()) return;
+    // Blocage global: utilisateur blacklist n'a accès à aucune commande
+    if (isUserBlacklisted(interaction.user.id)) {
       try {
-        const answerResult = await withTyping(interaction.channel, async () => {
-          let channelContext = '';
-          if (useContext && ENABLE_CHANNEL_CONTEXT) {
-            try {
-              channelContext = await buildChannelContext({
-                channel: interaction.channel,
-                uptoMessageId: null, // interaction pas liée à message spécifique
-                overrideLimit: null,
-                limit: CHANNEL_CONTEXT_LIMIT,
-                threadLimit: CHANNEL_CONTEXT_THREAD_LIMIT,
-                maxOverride: CHANNEL_CONTEXT_MAX_OVERRIDE,
-                botId: interaction.client.user.id,
-                maxAgeMs: CHANNEL_CONTEXT_MESSAGE_MAX_AGE_MS
-              });
-            } catch (e) { if (DEBUG_MODE) console.log('[debug][ask][context][error]', e); }
-          }
-          const channelPrompt = getChannelPrompt(interaction.channel.id);
-          return generateAnswer({ userQuestion: question, channelContext, debug: DEBUG_MODE, modelOverride: chosenModel, systemPromptOverride: channelPrompt });
-        });
-        if (!answerResult.ok) {
-          await interaction.editReply({ content: `Erreur: ${answerResult.error}` });
-        } else {
-          const embeds = buildAIEmbeds({ client: interaction.client, text: answerResult.text, model: chosenModel, maxChars: MAX_ANSWER_CHARS, debug: DEBUG_MODE, ms: answerResult.ms });
-          await interaction.editReply({ embeds });
-        }
-      } catch (e) {
-        await interaction.editReply({ content: 'Erreur interne.' });
-      }
+        await interaction.reply({ content: 'Tu es blacklist : aucune commande disponible.', flags: MessageFlags.Ephemeral });
+      } catch {}
       return;
     }
-    if (interaction.commandName === 'blacklist') {
-  if (!isAdmin(interaction.user.id, interaction.member)) {
-          await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
-          return;
+
+    // Logging basique
+    let subName = '';
+    try { subName = interaction.options.getSubcommand(); } catch {}
+    if (DEBUG_MODE) console.log(`[slash] /${interaction.commandName}${subName?` ${subName}`:''} user=${interaction.user.tag} (${interaction.user.id})`);
+
+    // Helper permission
+    const ensureAdmin = async () => {
+      if (!(await isAdmin(interaction.user.id, interaction.member, interaction.guild))) {
+        await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
+        return false;
+      }
+      return true;
+    };
+
+    switch (interaction.commandName) {
+      case 'ask': {
+        const question = interaction.options.getString('texte', true).trim();
+        const modelOpt = interaction.options.getString('model');
+        const publicFlag = interaction.options.getBoolean('public') || false;
+        const useContext = interaction.options.getBoolean('usecontext') || false;
+        let chosenModel = CURRENT_MODEL;
+        if (modelOpt && AVAILABLE_MODELS.includes(modelOpt)) chosenModel = modelOpt;
+        await interaction.deferReply({ ephemeral: !publicFlag });
+        try {
+          const answerResult = await withTyping(interaction.channel, async () => {
+            let channelContext = '';
+            if (useContext && ENABLE_CHANNEL_CONTEXT) {
+              try {
+                channelContext = await buildChannelContext({
+                  channel: interaction.channel,
+                  uptoMessageId: null,
+                  overrideLimit: null,
+                  limit: CHANNEL_CONTEXT_LIMIT,
+                  threadLimit: CHANNEL_CONTEXT_THREAD_LIMIT,
+                  maxOverride: CHANNEL_CONTEXT_MAX_OVERRIDE,
+                  botId: interaction.client.user.id,
+                  maxAgeMs: CHANNEL_CONTEXT_MESSAGE_MAX_AGE_MS
+                });
+              } catch (e) { if (DEBUG_MODE) console.log('[debug][ask][context][error]', e); }
+            }
+            const channelPrompt = getChannelPrompt(interaction.channel.id);
+            const rateCheck = checkAndRegisterModelUse(chosenModel);
+            if (!rateCheck.ok) return { ok:false, error: rateCheck.reason, ms:0 };
+            return generateAnswer({ userQuestion: question, channelContext, debug: DEBUG_MODE, modelOverride: chosenModel, systemPromptOverride: channelPrompt });
+          });
+          if (!answerResult.ok) {
+            await interaction.editReply({ content: `Erreur: ${answerResult.error}` });
+          } else {
+            const embeds = buildAIEmbeds({ client: interaction.client, text: answerResult.text, model: chosenModel, maxChars: MAX_ANSWER_CHARS, debug: DEBUG_MODE, ms: answerResult.ms });
+            await interaction.editReply({ embeds });
+          }
+        } catch (e) {
+          await interaction.editReply({ content: 'Erreur interne.' });
         }
-        const sub = interaction.options.getSubcommand();
+        return;
+      }
+      case 'blacklist': {
+        if (!(await ensureAdmin())) return;
+        let sub=''; try { sub = interaction.options.getSubcommand(); } catch {}
         if (sub === 'add') {
           const user = interaction.options.getUser('utilisateur', true);
-          if (isUserBlacklisted(user.id)) {
-            await interaction.reply({ content: `${user} est déjà blacklist.`, flags: MessageFlags.Ephemeral });
-            return;
-          }
-      addBlacklist(user.id);
-      await interaction.reply({ content: `${user} ajouté à la blacklist.`, flags: MessageFlags.Ephemeral });
-      return;
-        } else if (sub === 'remove') {
+          if (isUserBlacklisted(user.id)) { await interaction.reply({ content: `${user} déjà blacklist.`, flags: MessageFlags.Ephemeral }); return; }
+          addBlacklist(user.id);
+          await interaction.reply({ content: `${user} ajouté à la blacklist.`, flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (sub === 'remove') {
           const user = interaction.options.getUser('utilisateur', true);
-          if (!isUserBlacklisted(user.id)) {
-            await interaction.reply({ content: `${user} n'est pas blacklist.`, flags: MessageFlags.Ephemeral });
-            return;
-          }
-      removeBlacklist(user.id);
-      await interaction.reply({ content: `${user} retiré de la blacklist.`, flags: MessageFlags.Ephemeral });
-      return;
-        } else if (sub === 'list') {
-      const users = listBlacklist();
+          if (!isUserBlacklisted(user.id)) { await interaction.reply({ content: `${user} n'est pas blacklist.`, flags: MessageFlags.Ephemeral }); return; }
+          removeBlacklist(user.id);
+          await interaction.reply({ content: `${user} retiré de la blacklist.`, flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (sub === 'list') {
+          const users = listBlacklist();
           const display = users.length ? users.map(id => `<@${id}>`).join(', ') : 'Aucun';
           await interaction.reply({ content: `Blacklist (${users.length}): ${display}`, flags: MessageFlags.Ephemeral });
           return;
         }
+        await interaction.reply({ content: 'Sous-commande inconnue.', flags: MessageFlags.Ephemeral });
+        return;
       }
-      if (interaction.commandName === 'prompt') {
-        if (!CONFIG.enablePromptCommand) {
-          await interaction.reply({ content: 'La commande /prompt est désactivée.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-        if (!isAdmin(interaction.user.id, interaction.member)) {
-          await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-        let sub;
-        try { sub = interaction.options.getSubcommand(); } catch {}
+      case 'prompt': {
+        if (!CONFIG.enablePromptCommand) { await interaction.reply({ content: 'Commande désactivée.', flags: MessageFlags.Ephemeral }); return; }
+        if (!(await ensureAdmin())) return;
+        let sub=''; try { sub = interaction.options.getSubcommand(); } catch {}
         if (sub === 'show') {
-          const display = SYSTEM_PROMPT.length > 1800 ? SYSTEM_PROMPT.slice(0, 1800) + '…' : SYSTEM_PROMPT;
-          await interaction.reply({ content: `Prompt actuel (${SYSTEM_PROMPT.length} chars):\n${display}`, flags: MessageFlags.Ephemeral });
+          const display = SYSTEM_PROMPT.length > 1800 ? SYSTEM_PROMPT.slice(0,1800) + '…' : SYSTEM_PROMPT;
+            await interaction.reply({ content: `Prompt actuel (${SYSTEM_PROMPT.length} chars):\n${display}`, flags: MessageFlags.Ephemeral });
           return;
         }
         if (sub === 'set') {
@@ -244,17 +292,13 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: 'Sous-commande inconnue.', flags: MessageFlags.Ephemeral });
         return;
       }
-      if (interaction.commandName === 'channelprompt') {
-        if (!isAdmin(interaction.user.id, interaction.member)) {
-          await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-        let sub = '';
-        try { sub = interaction.options.getSubcommand(); } catch {}
+      case 'channelprompt': {
+        if (!(await ensureAdmin())) return;
+        let sub=''; try { sub = interaction.options.getSubcommand(); } catch {}
         if (sub === 'show') {
           const cp = getChannelPrompt(interaction.channel.id);
           if (!cp) { await interaction.reply({ content: 'Aucun prompt défini pour ce salon.', flags: MessageFlags.Ephemeral }); return; }
-          const display = cp.length > 1800 ? cp.slice(0,1800) + '…' : cp;
+          const display = cp.length > 1800 ? cp.slice(0,1800)+'…' : cp;
           await interaction.reply({ content: `Prompt salon (${cp.length} chars):\n${display}`, flags: MessageFlags.Ephemeral });
           return;
         }
@@ -276,31 +320,63 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (sub === 'list') {
           const list = listChannelPrompts();
           if (!list.length) { await interaction.reply({ content: 'Aucun salon avec prompt.', flags: MessageFlags.Ephemeral }); return; }
-            const lines = list.slice(0,50).map(e=>`<#${e.channelId}> (${e.channelId}) : ${e.length} chars`);
-            await interaction.reply({ content: `Prompts salons (${list.length}):\n${lines.join('\n')}`, flags: MessageFlags.Ephemeral });
-            return;
+          const lines = list.slice(0,50).map(e=>`<#${e.channelId}> (${e.channelId}) : ${e.length} chars`);
+          await interaction.reply({ content: `Prompts salons (${list.length}):\n${lines.join('\n')}`, flags: MessageFlags.Ephemeral });
+          return;
         }
         await interaction.reply({ content: 'Sous-commande inconnue.', flags: MessageFlags.Ephemeral });
         return;
       }
-      if (interaction.commandName === 'options') {
-        if (!isAdmin(interaction.user.id, interaction.member)) {
-          await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
+      case 'ratelimit': {
+        if (!(await ensureAdmin())) return;
+        let sub=''; try { sub = interaction.options.getSubcommand(); } catch {}
+        const model = interaction.options.getString('model');
+        if (sub === 'show') {
+          const cfg = getModelRateLimit(model);
+          if (!cfg) { await interaction.reply({ content:`Aucune limite pour ${model}.`, flags: MessageFlags.Ephemeral }); return; }
+          await interaction.reply({ content:`Limites ${model}: cooldownSeconds=${cfg.cooldownSeconds||0}, maxPerHour=${cfg.maxPerHour||0}`, flags: MessageFlags.Ephemeral }); return;
+        }
+        if (sub === 'setcooldown') {
+          const seconds = interaction.options.getInteger('seconds', true);
+          setModelRateLimit(model, { cooldownSeconds: seconds });
+          const cfg = getModelRateLimit(model);
+          await interaction.reply({ content:`Cooldown ${model} => ${cfg.cooldownSeconds||0}s`, flags: MessageFlags.Ephemeral }); return;
+        }
+        if (sub === 'setmaxhour') {
+          const count = interaction.options.getInteger('count', true);
+          setModelRateLimit(model, { maxPerHour: count });
+          const cfg = getModelRateLimit(model);
+          await interaction.reply({ content:`Max/h ${model} => ${cfg.maxPerHour||0}`, flags: MessageFlags.Ephemeral }); return;
+        }
+        if (sub === 'clear') {
+          if (clearModelRateLimit(model)) { await interaction.reply({ content:`Limites supprimées pour ${model}.`, flags: MessageFlags.Ephemeral }); }
+          else { await interaction.reply({ content:`Aucune limite à supprimer pour ${model}.`, flags: MessageFlags.Ephemeral }); }
           return;
         }
-  // options legacy supprimées
-  const newMaxChars = interaction.options.getInteger('maxanswerchars');
+        if (sub === 'list') {
+          const list = listModelRateLimits();
+          if (!list.length) { await interaction.reply({ content:'Aucune limite définie.', flags: MessageFlags.Ephemeral }); return; }
+          const lines = list.map(l=>`${l.model}: cooldown=${l.cooldownSeconds||0}s maxPerHour=${l.maxPerHour||0}`);
+          await interaction.reply({ content:`Limites modèles (${list.length}):\n${lines.join('\n')}`, flags: MessageFlags.Ephemeral }); return;
+        }
+        await interaction.reply({ content:'Sous-commande inconnue.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      case 'options': {
+        if (!(await ensureAdmin())) return;
+        const newMaxChars = interaction.options.getInteger('maxanswerchars');
         const newModel = interaction.options.getString('model');
-  const newEnableChanCtx = interaction.options.getBoolean('enablechannelcontext');
-  const newChanCtxLimit = interaction.options.getInteger('channelcontextlimit');
-  const newChanCtxThreadLimit = interaction.options.getInteger('channelcontextthreadlimit');
-  const newDebugLog = interaction.options.getBoolean('debug');
+        const newEnableChanCtx = interaction.options.getBoolean('enablechannelcontext');
+        const newChanCtxLimit = interaction.options.getInteger('channelcontextlimit');
+        const newChanCtxThreadLimit = interaction.options.getInteger('channelcontextthreadlimit');
+        const newDebugLog = interaction.options.getBoolean('debug');
         const newChanCtxMaxOverride = interaction.options.getInteger('channelcontextmaxoverride');
         const newChanCtxAutoForget = interaction.options.getInteger('channelcontextautoforget');
-  const newRequireMention = interaction.options.getBoolean('requiremention');
-  const newChanCtxMaxAge = interaction.options.getInteger('channelcontextmaxage');
-  if (newMaxChars === null && !newModel && newEnableChanCtx === null && newChanCtxLimit === null && newChanCtxThreadLimit === null && newDebugLog === null && newChanCtxMaxOverride === null && newChanCtxAutoForget === null && newRequireMention === null && newChanCtxMaxAge === null) {
-          await interaction.reply({ content: `Valeurs actuelles:\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}\n- enableChannelContext: ${ENABLE_CHANNEL_CONTEXT}\n- channelContextMessageLimit: ${CHANNEL_CONTEXT_LIMIT}\n- channelContextMaxOverride: ${CHANNEL_CONTEXT_MAX_OVERRIDE}\n- channelContextAutoForgetSeconds: ${CHANNEL_CONTEXT_AUTO_FORGET_MS/1000}\n- channelContextMessageMaxAgeSeconds: ${CHANNEL_CONTEXT_MESSAGE_MAX_AGE_MS/1000}\n- requireMentionOrReply: ${REQUIRE_MENTION_OR_REPLY}\n- debug: ${DEBUG_MODE}\n- currentModel: ${CURRENT_MODEL}\n- availableModels: ${AVAILABLE_MODELS.join(', ')}` , flags: MessageFlags.Ephemeral });
+        const newRequireMention = interaction.options.getBoolean('requiremention');
+        const newChanCtxMaxAge = interaction.options.getInteger('channelcontextmaxage');
+
+        if (newMaxChars === null && !newModel && newEnableChanCtx === null && newChanCtxLimit === null && newChanCtxThreadLimit === null && newDebugLog === null && newChanCtxMaxOverride === null && newChanCtxAutoForget === null && newRequireMention === null && newChanCtxMaxAge === null) {
+          await interaction.reply({ content: `Valeurs actuelles:\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}\n- enableChannelContext: ${ENABLE_CHANNEL_CONTEXT}\n- channelContextMessageLimit: ${CHANNEL_CONTEXT_LIMIT}\n- channelContextThreadMessageLimit: ${CHANNEL_CONTEXT_THREAD_LIMIT}\n- channelContextMaxOverride: ${CHANNEL_CONTEXT_MAX_OVERRIDE}\n- channelContextAutoForgetSeconds: ${CHANNEL_CONTEXT_AUTO_FORGET_MS/1000}\n- channelContextMessageMaxAgeSeconds: ${CHANNEL_CONTEXT_MESSAGE_MAX_AGE_MS/1000}\n- requireMentionOrReply: ${REQUIRE_MENTION_OR_REPLY}\n- debug: ${DEBUG_MODE}\n- currentModel: ${CURRENT_MODEL}\n- availableModels: ${AVAILABLE_MODELS.join(', ')}` , flags: MessageFlags.Ephemeral });
           return;
         }
         const summary = [];
@@ -351,11 +427,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
           summary.push(`channelContextMessageMaxAgeSeconds => ${safeSec}` + (safeSec !== newChanCtxMaxAge ? ' (ajusté)' : ''));
         }
         if (newModel) {
-          if (setCurrentModel(newModel)) {
-            summary.push(`model => ${CURRENT_MODEL}`);
-          } else {
-            summary.push(`model => valeur inconnue (${newModel}) ignorée`);
-          }
+          if (setCurrentModel(newModel)) { summary.push(`model => ${CURRENT_MODEL}`); }
+          else { summary.push(`model => valeur inconnue (${newModel}) ignorée`); }
         }
         if (newDebugLog !== null) {
           DEBUG_MODE = newDebugLog;
@@ -366,109 +439,86 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await interaction.reply({ content: `Options mises à jour:\n${summary.join('\n')}`, flags: MessageFlags.Ephemeral });
         return;
       }
-      if (interaction.commandName === 'op') {
-        if (!isAdmin(interaction.user.id, interaction.member)) {
-          await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
-          return;
-        }
-  const sub = interaction.options.getSubcommand();
+      case 'op': {
+        if (!(await ensureAdmin())) return;
+        const sub = interaction.options.getSubcommand();
         if (sub === 'add') {
           const user = interaction.options.getUser('utilisateur', true);
           const uid = String(user.id);
-          if (ADMIN_USER_IDS.includes(uid)) {
-            await interaction.reply({ content: `${user} est déjà admin.`, flags: MessageFlags.Ephemeral });
-            return;
-          }
+          if (ADMIN_USER_IDS.includes(uid)) { await interaction.reply({ content: `${user} est déjà admin.`, flags: MessageFlags.Ephemeral }); return; }
           ADMIN_USER_IDS.push(uid);
           CONFIG.whitelistAdminUserIds = Array.from(new Set(ADMIN_USER_IDS));
           saveConfig();
           await interaction.reply({ content: `${user} ajouté aux admins.`, flags: MessageFlags.Ephemeral });
           return;
-        } else if (sub === 'remove') {
+        }
+        if (sub === 'remove') {
           const user = interaction.options.getUser('utilisateur', true);
-            const uid = String(user.id);
-            if (!ADMIN_USER_IDS.includes(uid)) {
-              await interaction.reply({ content: `${user} n'est pas admin.`, flags: MessageFlags.Ephemeral });
-              return;
-            }
-            ADMIN_USER_IDS = ADMIN_USER_IDS.filter(id => id !== uid);
-            CONFIG.whitelistAdminUserIds = ADMIN_USER_IDS;
-            saveConfig();
-            await interaction.reply({ content: `${user} retiré des admins.`, flags: MessageFlags.Ephemeral });
-            return;
-        } else if (sub === 'list') {
+          const uid = String(user.id);
+          if (!ADMIN_USER_IDS.includes(uid)) { await interaction.reply({ content: `${user} n'est pas admin.`, flags: MessageFlags.Ephemeral }); return; }
+          ADMIN_USER_IDS = ADMIN_USER_IDS.filter(id => id !== uid);
+          CONFIG.whitelistAdminUserIds = ADMIN_USER_IDS;
+          saveConfig();
+          await interaction.reply({ content: `${user} retiré des admins.`, flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (sub === 'list') {
           const list = ADMIN_USER_IDS.length ? ADMIN_USER_IDS.map(id => `<@${id}>`).join(', ') : 'Aucun';
           await interaction.reply({ content: `Admins utilisateurs (${ADMIN_USER_IDS.length}): ${list}`, flags: MessageFlags.Ephemeral });
           return;
         }
+        await interaction.reply({ content: 'Sous-commande inconnue.', flags: MessageFlags.Ephemeral });
+        return;
       }
-      if (interaction.commandName === 'whitelistchannels') {
-        if (!isAdmin(interaction.user.id, interaction.member)) {
-          await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
-          return;
-        }
+      case 'whitelistchannels': {
+        if (!(await ensureAdmin())) return;
         const sub = interaction.options.getSubcommand();
         if (sub === 'add') {
           const ch = interaction.options.getChannel('salon', true);
           const id = ch.id;
-          if (WHITELIST.includes(id)) {
-            await interaction.reply({ content: `${ch} déjà dans la whitelist.`, flags: MessageFlags.Ephemeral });
-            return;
-          }
+          if (WHITELIST.includes(id)) { await interaction.reply({ content: `${ch} déjà dans la whitelist.`, flags: MessageFlags.Ephemeral }); return; }
           WHITELIST.push(id);
           CONFIG.whitelistChannelIds = WHITELIST;
           saveConfig();
           await interaction.reply({ content: `${ch} ajouté à la whitelist.`, flags: MessageFlags.Ephemeral });
           return;
-        } else if (sub === 'remove') {
+        }
+        if (sub === 'remove') {
           const ch = interaction.options.getChannel('salon', true);
           const id = ch.id;
-            if (!WHITELIST.includes(id)) {
-              await interaction.reply({ content: `${ch} n'est pas dans la whitelist.`, flags: MessageFlags.Ephemeral });
-              return;
-            }
-            WHITELIST = WHITELIST.filter(c => c !== id);
-            CONFIG.whitelistChannelIds = WHITELIST;
-            saveConfig();
-            await interaction.reply({ content: `${ch} retiré de la whitelist.`, flags: MessageFlags.Ephemeral });
-            return;
-        } else if (sub === 'list') {
-          if (!WHITELIST.length) {
-            await interaction.reply({ content: 'Whitelist vide (tous les salons autorisés).', flags: MessageFlags.Ephemeral });
-            return;
-          }
+          if (!WHITELIST.includes(id)) { await interaction.reply({ content: `${ch} n'est pas dans la whitelist.`, flags: MessageFlags.Ephemeral }); return; }
+          WHITELIST = WHITELIST.filter(c => c !== id);
+          CONFIG.whitelistChannelIds = WHITELIST;
+          saveConfig();
+          await interaction.reply({ content: `${ch} retiré de la whitelist.`, flags: MessageFlags.Ephemeral });
+          return;
+        }
+        if (sub === 'list') {
+          if (!WHITELIST.length) { await interaction.reply({ content: 'Whitelist vide (tous les salons autorisés).', flags: MessageFlags.Ephemeral }); return; }
           const display = WHITELIST.map(id => `<#${id}>`).join(', ');
           await interaction.reply({ content: `Salons whitelists (${WHITELIST.length}): ${display}`, flags: MessageFlags.Ephemeral });
           return;
         }
+        await interaction.reply({ content: 'Sous-commande inconnue.', flags: MessageFlags.Ephemeral });
+        return;
       }
-      if (interaction.commandName === 'resetcontext') {
-        if (!isAdmin(interaction.user.id, interaction.member)) {
-          await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
-          return;
-        }
+      case 'resetcontext': {
+        if (!(await ensureAdmin())) return;
         const all = interaction.options.getBoolean('all') || false;
         let cleared = 0;
-        if (all) {
-          cleared = channelLastContextUsage.size;
-          channelLastContextUsage.clear();
-        } else {
-          if (channelLastContextUsage.delete(interaction.channelId)) cleared++;
-        }
+        if (all) { cleared = channelLastContextUsage.size; channelLastContextUsage.clear(); }
+        else { if (channelLastContextUsage.delete(interaction.channelId)) cleared++; }
         await interaction.reply({ content: `Contexte réinitialisé (${all?'global':'salon'}) – entrées effacées: ${cleared}.`, flags: MessageFlags.Ephemeral });
         return;
       }
-      return; // autre commande ignorée
+      default: return; // ignorer autres commandes
     }
-
-  // Aucun bouton géré désormais
-  if (!interaction.isButton()) return;
-  return;
   } catch (e) {
     console.error('Erreur InteractionCreate', e);
     try {
-      if (interaction.isRepliable() && !interaction.replied) {
-        await interaction.editReply('Erreur interne pendant le traitement du bouton.');
+      if (interaction.isRepliable()) {
+        if (interaction.deferred || interaction.replied) await interaction.followUp({ content: 'Erreur interne.', flags: MessageFlags.Ephemeral });
+        else await interaction.reply({ content: 'Erreur interne.', flags: MessageFlags.Ephemeral });
       }
     } catch {}
   }

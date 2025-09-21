@@ -68,6 +68,16 @@ export function buildSlashCommands() {
     .addSubcommand(sc=>sc.setName('list').setDescription('Lister les salons ayant un prompt (id + longueur)'));
   cmds.push(chPrompt);
 
+  const modelRate = new SlashCommandBuilder()
+    .setName('ratelimit')
+    .setDescription('Limiter usage des modèles (admin)')
+    .addSubcommand(sc=>sc.setName('show').setDescription('Afficher limites d\'un modèle').addStringOption(o=>o.setName('model').setDescription('Nom modèle').setRequired(true)))
+    .addSubcommand(sc=>sc.setName('setcooldown').setDescription('Définir cooldown (s) pour un modèle').addStringOption(o=>o.setName('model').setDescription('Nom modèle').setRequired(true)).addIntegerOption(o=>o.setName('seconds').setDescription('Secondes (0-3600)').setRequired(true).setMinValue(0).setMaxValue(3600)))
+    .addSubcommand(sc=>sc.setName('setmaxhour').setDescription('Définir max appels par heure').addStringOption(o=>o.setName('model').setDescription('Nom modèle').setRequired(true)).addIntegerOption(o=>o.setName('count').setDescription('Nombre (0=illimité)').setRequired(true).setMinValue(0).setMaxValue(10000)))
+    .addSubcommand(sc=>sc.setName('clear').setDescription('Supprimer limites d\'un modèle').addStringOption(o=>o.setName('model').setDescription('Nom modèle').setRequired(true)))
+    .addSubcommand(sc=>sc.setName('list').setDescription('Lister limites existantes'));
+  cmds.push(modelRate);
+
   // Commande /ask (question directe sans mention obligatoire)
   const askCmd = new SlashCommandBuilder()
     .setName('ask')

@@ -1,7 +1,7 @@
 {
   "guildId": "955492590772449381",
   "whitelistChannelIds": [],
-  "whitelistAdminUserIds": [],
+  "whitelistAdminUserIds": ["317718119965523980"],
   "whitelistAdminRoleIds": [
     "1416023614834085918"
   ],
