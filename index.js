@@ -4,7 +4,7 @@ import { CONFIG, AVAILABLE_MODELS, CURRENT_MODEL, setCurrentModel, SYSTEM_PROMPT
 import { loadBlacklist, isUserBlacklisted, addBlacklist, removeBlacklist, listBlacklist } from './lib/blacklist.js';
 import { buildChannelContext } from './lib/context.js';
 import { generateAnswer } from './lib/ai.js';
-import { withTyping, sendAIResponse, sendAIError } from './lib/respond.js';
+import { withTyping, sendAIResponse, sendAIError, buildAIEmbeds } from './lib/respond.js';
 import { registerSlashCommands } from './commands.js';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -31,22 +31,22 @@ if (MAX_ANSWER_CHARS !== CONFIG.maxAnswerCharsPerMessage) { CONFIG.maxAnswerChar
 let ENABLE_CHANNEL_CONTEXT = typeof CONFIG.enableChannelContext === 'boolean' ? CONFIG.enableChannelContext : true;
 let CHANNEL_CONTEXT_LIMIT = (typeof CONFIG.channelContextMessageLimit === 'number' && CONFIG.channelContextMessageLimit > 0) ? Math.min(25, CONFIG.channelContextMessageLimit) : 6;
 if (CHANNEL_CONTEXT_LIMIT !== CONFIG.channelContextMessageLimit) { CONFIG.channelContextMessageLimit = CHANNEL_CONTEXT_LIMIT; saveConfig(); }
+let CHANNEL_CONTEXT_THREAD_LIMIT = (typeof CONFIG.channelContextThreadMessageLimit === 'number' && CONFIG.channelContextThreadMessageLimit > 0) ? Math.min(100, CONFIG.channelContextThreadMessageLimit) : 30;
+if (CHANNEL_CONTEXT_THREAD_LIMIT !== CONFIG.channelContextThreadMessageLimit) { CONFIG.channelContextThreadMessageLimit = CHANNEL_CONTEXT_THREAD_LIMIT; saveConfig(); }
 let DEBUG_MODE = !!CONFIG.debug;
 let CHANNEL_CONTEXT_MAX_OVERRIDE = (typeof CONFIG.channelContextMaxOverride === 'number' && CONFIG.channelContextMaxOverride > 0) ? Math.min(50, CONFIG.channelContextMaxOverride) : 20;
 if (CHANNEL_CONTEXT_MAX_OVERRIDE !== CONFIG.channelContextMaxOverride) { CONFIG.channelContextMaxOverride = CHANNEL_CONTEXT_MAX_OVERRIDE; saveConfig(); }
 let CHANNEL_CONTEXT_AUTO_FORGET_MS = (typeof CONFIG.channelContextAutoForgetSeconds === 'number' && CONFIG.channelContextAutoForgetSeconds > 0)
   ? Math.min(24*3600, CONFIG.channelContextAutoForgetSeconds) * 1000 : 0;
 if ((CHANNEL_CONTEXT_AUTO_FORGET_MS/1000) !== CONFIG.channelContextAutoForgetSeconds) { CONFIG.channelContextAutoForgetSeconds = CHANNEL_CONTEXT_AUTO_FORGET_MS/1000; saveConfig(); }
-let ENABLE_AUTO_RESPONSE = !!CONFIG.enableAutoResponse;
-let AUTO_RESPONSE_MIN_INTERVAL = (typeof CONFIG.autoResponseMinIntervalSeconds === 'number' && CONFIG.autoResponseMinIntervalSeconds >= 30)
-  ? Math.min(3600, CONFIG.autoResponseMinIntervalSeconds) : 180;
-if (AUTO_RESPONSE_MIN_INTERVAL !== CONFIG.autoResponseMinIntervalSeconds) { CONFIG.autoResponseMinIntervalSeconds = AUTO_RESPONSE_MIN_INTERVAL; saveConfig(); }
-let AUTO_RESPONSE_PROB = (typeof CONFIG.autoResponseProbability === 'number') ? Math.min(1, Math.max(0, CONFIG.autoResponseProbability)) : 0.25;
-if (AUTO_RESPONSE_PROB !== CONFIG.autoResponseProbability) { CONFIG.autoResponseProbability = AUTO_RESPONSE_PROB; saveConfig(); }
+let CHANNEL_CONTEXT_MESSAGE_MAX_AGE_MS = (typeof CONFIG.channelContextMessageMaxAgeSeconds === 'number' && CONFIG.channelContextMessageMaxAgeSeconds >= 60)
+  ? Math.min(86400, CONFIG.channelContextMessageMaxAgeSeconds) * 1000 : 3600*1000;
+if ((CHANNEL_CONTEXT_MESSAGE_MAX_AGE_MS/1000) !== CONFIG.channelContextMessageMaxAgeSeconds) { CONFIG.channelContextMessageMaxAgeSeconds = CHANNEL_CONTEXT_MESSAGE_MAX_AGE_MS/1000; saveConfig(); }
+let REQUIRE_MENTION_OR_REPLY = typeof CONFIG.requireMentionOrReply === 'boolean' ? CONFIG.requireMentionOrReply : true;
+if (REQUIRE_MENTION_OR_REPLY !== CONFIG.requireMentionOrReply) { CONFIG.requireMentionOrReply = REQUIRE_MENTION_OR_REPLY; saveConfig(); }
 
 // --- Etats mémoire ---
 const channelLastContextUsage = new Map();
-const lastAutoResponsePerChannel = new Map();
 
 // --- Helpers ---
 function isAdmin(userId, member) {
@@ -86,38 +86,8 @@ client.on(Events.MessageCreate, async (message) => {
       try { const ref = await message.fetchReference(); replyToBot = ref.author?.id === botId; } catch {}
     }
 
-    // AUTO RESPONSE si pas mention / reply direct
-    if (!mentioned && !replyToBot) {
-      if (ENABLE_AUTO_RESPONSE) {
-        try {
-          const raw = (message.content || '').trim();
-          if (DEBUG_MODE) console.log('[debug][autoResponse][incoming]', { len: raw.length, channel: message.channel.id, sample: raw.slice(0,80) });
-          if (raw.length >= 25 && /[a-zA-ZÀ-ÖØ-öø-ÿ!?]/.test(raw)) {
-            const now = Date.now();
-            const last = lastAutoResponsePerChannel.get(message.channel.id) || 0;
-            const elapsed = now - last;
-            if (elapsed >= AUTO_RESPONSE_MIN_INTERVAL * 1000) {
-              if (Math.random() <= AUTO_RESPONSE_PROB) {
-                const answerResult = await withTyping(message.channel, async () => {
-                  let miniCtx = '';
-                  try { miniCtx = await buildChannelContext({ channel: message.channel, uptoMessageId: message.id, overrideLimit: null, limit: Math.min(4, CHANNEL_CONTEXT_LIMIT), maxOverride: CHANNEL_CONTEXT_MAX_OVERRIDE, botId }); } catch {}
-                  const guidanceQuestion = `Analyse ce court échange et propose, si pertinent, un conseil ou clarification utile en UNE ou DEUX phrases maximum. Ne réponds que si tu peux réellement aider sans répéter obvious. Message le plus récent: "${raw.slice(0,280)}"`;
-                  return generateAnswer({ userQuestion: guidanceQuestion, channelContext: miniCtx, debug: DEBUG_MODE });
-                });
-                if (answerResult.ok) {
-                  const txt = answerResult.text.trim();
-                  if (txt && txt.length <= 350 && !/je suis un modèle|assistant ia/i.test(txt)) {
-                    await sendAIResponse({ type: 'suggestion', channel: message.channel, text: txt, ms: answerResult.ms, model: CURRENT_MODEL, maxChars: MAX_ANSWER_CHARS, debug: DEBUG_MODE });
-                    lastAutoResponsePerChannel.set(message.channel.id, now);
-                  } else if (DEBUG_MODE) { console.log('[debug][autoResponse][filtered]', { ok: answerResult.ok, txtLen: txt.length }); }
-                } else if (DEBUG_MODE) { console.log('[debug][autoResponse][genfail]', { error: answerResult.error }); }
-              } else if (DEBUG_MODE) { console.log('[debug][autoResponse][skip] probability gate'); }
-            } else if (DEBUG_MODE) { console.log('[debug][autoResponse][skip] interval', { elapsedMs: elapsed }); }
-          } else if (DEBUG_MODE) { console.log('[debug][autoResponse][skip] heuristique longueur/charset'); }
-        } catch {}
-      }
-      return;
-    }
+  // Option require mention ou reply
+  if (REQUIRE_MENTION_OR_REPLY && !mentioned && !replyToBot) return;
 
     // Question utilisateur (strip mention)
     let userQuestion = (message.content || '').replace(new RegExp(`<@!?${botId}>`, 'g'), '').trim();
@@ -129,7 +99,7 @@ client.on(Events.MessageCreate, async (message) => {
         channel: message.channel.id,
         length: userQuestion.length,
         contextEnabled: ENABLE_CHANNEL_CONTEXT,
-        autoResponseEnabled: ENABLE_AUTO_RESPONSE
+  requireMentionOrReply: REQUIRE_MENTION_OR_REPLY
       });
     }
 
@@ -148,8 +118,10 @@ client.on(Events.MessageCreate, async (message) => {
             uptoMessageId: message.id,
             overrideLimit: null,
             limit: CHANNEL_CONTEXT_LIMIT,
+            threadLimit: CHANNEL_CONTEXT_THREAD_LIMIT,
             maxOverride: CHANNEL_CONTEXT_MAX_OVERRIDE,
-            botId
+            botId,
+            maxAgeMs: CHANNEL_CONTEXT_MESSAGE_MAX_AGE_MS
           });
           channelLastContextUsage.set(message.channel.id, Date.now());
         } catch (e) { if (DEBUG_MODE) console.log('[debug][context][error]', e); }
@@ -161,7 +133,7 @@ client.on(Events.MessageCreate, async (message) => {
       await sendAIError({ channel: message.channel, error: answerResult.error, ms: answerResult.ms, model: CURRENT_MODEL });
       return;
     }
-    await sendAIResponse({ type: 'answer', channel: message.channel, text: answerResult.text, ms: answerResult.ms, model: CURRENT_MODEL, maxChars: MAX_ANSWER_CHARS, debug: DEBUG_MODE });
+  await sendAIResponse({ channel: message.channel, text: answerResult.text, ms: answerResult.ms, model: CURRENT_MODEL, maxChars: MAX_ANSWER_CHARS, debug: DEBUG_MODE });
 
   } catch (err) {
     console.error('Erreur messageCreate', err);
@@ -177,6 +149,47 @@ client.on(Events.InteractionCreate, async (interaction) => {
   // Log exécution commande (avant permission pour audit)
   let subName = ''; try { subName = interaction.options.getSubcommand(); } catch {}
   try { console.log(`[slash] cmd=/${interaction.commandName}${subName?` sub=${subName}`:''} user=${interaction.user.tag} (${interaction.user.id})`); } catch {}
+    if (interaction.commandName === 'ask') {
+      const question = interaction.options.getString('texte', true).trim();
+      const modelOpt = interaction.options.getString('model');
+      const publicFlag = interaction.options.getBoolean('public') || false;
+      const useContext = interaction.options.getBoolean('usecontext') || false;
+  // Cohérence contexte: on réutilise exactement buildChannelContext avec mêmes limites
+  // que pour un ping (CHANNEL_CONTEXT_LIMIT, CHANNEL_CONTEXT_MAX_OVERRIDE).
+  // Pour une interaction slash, pas de message déclencheur -> uptoMessageId:null.
+      let chosenModel = CURRENT_MODEL;
+      if (modelOpt && AVAILABLE_MODELS.includes(modelOpt)) chosenModel = modelOpt;
+      await interaction.deferReply({ ephemeral: !publicFlag });
+      try {
+        const answerResult = await withTyping(interaction.channel, async () => {
+          let channelContext = '';
+          if (useContext && ENABLE_CHANNEL_CONTEXT) {
+            try {
+              channelContext = await buildChannelContext({
+                channel: interaction.channel,
+                uptoMessageId: null, // interaction pas liée à message spécifique
+                overrideLimit: null,
+                limit: CHANNEL_CONTEXT_LIMIT,
+                threadLimit: CHANNEL_CONTEXT_THREAD_LIMIT,
+                maxOverride: CHANNEL_CONTEXT_MAX_OVERRIDE,
+                botId: interaction.client.user.id,
+                maxAgeMs: CHANNEL_CONTEXT_MESSAGE_MAX_AGE_MS
+              });
+            } catch (e) { if (DEBUG_MODE) console.log('[debug][ask][context][error]', e); }
+          }
+          return generateAnswer({ userQuestion: question, channelContext, debug: DEBUG_MODE, modelOverride: chosenModel });
+        });
+        if (!answerResult.ok) {
+          await interaction.editReply({ content: `Erreur: ${answerResult.error}` });
+        } else {
+          const embeds = buildAIEmbeds({ client: interaction.client, text: answerResult.text, model: chosenModel, maxChars: MAX_ANSWER_CHARS, debug: DEBUG_MODE, ms: answerResult.ms });
+          await interaction.editReply({ embeds });
+        }
+      } catch (e) {
+        await interaction.editReply({ content: 'Erreur interne.' });
+      }
+      return;
+    }
     if (interaction.commandName === 'blacklist') {
   if (!isAdmin(interaction.user.id, interaction.member)) {
           await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
@@ -239,19 +252,19 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
           return;
         }
-  // options thread supprimées
-        const newMaxChars = interaction.options.getInteger('maxanswerchars');
+  // options legacy supprimées
+  const newMaxChars = interaction.options.getInteger('maxanswerchars');
         const newModel = interaction.options.getString('model');
   const newEnableChanCtx = interaction.options.getBoolean('enablechannelcontext');
   const newChanCtxLimit = interaction.options.getInteger('channelcontextlimit');
+  const newChanCtxThreadLimit = interaction.options.getInteger('channelcontextthreadlimit');
   const newDebugLog = interaction.options.getBoolean('debug');
         const newChanCtxMaxOverride = interaction.options.getInteger('channelcontextmaxoverride');
         const newChanCtxAutoForget = interaction.options.getInteger('channelcontextautoforget');
-        const newEnableAuto = interaction.options.getBoolean('enableautoresponse');
-        const newAutoInterval = interaction.options.getInteger('autoresponseinterval');
-        const newAutoProb = interaction.options.getNumber('autoresponseprobability');
-  if (newMaxChars === null && !newModel && newEnableChanCtx === null && newChanCtxLimit === null && newDebugLog === null && newChanCtxMaxOverride === null && newChanCtxAutoForget === null && newEnableAuto === null && newAutoInterval === null && newAutoProb === null) {
-          await interaction.reply({ content: `Valeurs actuelles:\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}\n- enableChannelContext: ${ENABLE_CHANNEL_CONTEXT}\n- channelContextMessageLimit: ${CHANNEL_CONTEXT_LIMIT}\n- channelContextMaxOverride: ${CHANNEL_CONTEXT_MAX_OVERRIDE}\n- channelContextAutoForgetSeconds: ${CHANNEL_CONTEXT_AUTO_FORGET_MS/1000}\n- debug: ${DEBUG_MODE}\n- enableAutoResponse: ${ENABLE_AUTO_RESPONSE}\n- autoResponseMinIntervalSeconds: ${AUTO_RESPONSE_MIN_INTERVAL}\n- autoResponseProbability: ${AUTO_RESPONSE_PROB}\n- currentModel: ${CURRENT_MODEL}\n- availableModels: ${AVAILABLE_MODELS.join(', ')}` , flags: MessageFlags.Ephemeral });
+  const newRequireMention = interaction.options.getBoolean('requiremention');
+  const newChanCtxMaxAge = interaction.options.getInteger('channelcontextmaxage');
+  if (newMaxChars === null && !newModel && newEnableChanCtx === null && newChanCtxLimit === null && newChanCtxThreadLimit === null && newDebugLog === null && newChanCtxMaxOverride === null && newChanCtxAutoForget === null && newRequireMention === null && newChanCtxMaxAge === null) {
+          await interaction.reply({ content: `Valeurs actuelles:\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}\n- enableChannelContext: ${ENABLE_CHANNEL_CONTEXT}\n- channelContextMessageLimit: ${CHANNEL_CONTEXT_LIMIT}\n- channelContextMaxOverride: ${CHANNEL_CONTEXT_MAX_OVERRIDE}\n- channelContextAutoForgetSeconds: ${CHANNEL_CONTEXT_AUTO_FORGET_MS/1000}\n- channelContextMessageMaxAgeSeconds: ${CHANNEL_CONTEXT_MESSAGE_MAX_AGE_MS/1000}\n- requireMentionOrReply: ${REQUIRE_MENTION_OR_REPLY}\n- debug: ${DEBUG_MODE}\n- currentModel: ${CURRENT_MODEL}\n- availableModels: ${AVAILABLE_MODELS.join(', ')}` , flags: MessageFlags.Ephemeral });
           return;
         }
         const summary = [];
@@ -260,10 +273,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
           CONFIG.enableChannelContext = newEnableChanCtx;
           summary.push(`enableChannelContext => ${newEnableChanCtx}`);
         }
-        if (newEnableAuto !== null) {
-          ENABLE_AUTO_RESPONSE = newEnableAuto;
-          CONFIG.enableAutoResponse = newEnableAuto;
-          summary.push(`enableAutoResponse => ${newEnableAuto}`);
+        if (newRequireMention !== null) {
+          REQUIRE_MENTION_OR_REPLY = newRequireMention;
+          CONFIG.requireMentionOrReply = newRequireMention;
+          summary.push(`requireMentionOrReply => ${newRequireMention}`);
         }
         if (typeof newMaxChars === 'number') {
           const clamped = Math.max(500, Math.min(4000, newMaxChars));
@@ -277,6 +290,12 @@ client.on(Events.InteractionCreate, async (interaction) => {
           CONFIG.channelContextMessageLimit = safe;
           summary.push(`channelContextMessageLimit => ${safe}` + (safe !== newChanCtxLimit ? ' (ajusté)' : ''));
         }
+        if (typeof newChanCtxThreadLimit === 'number') {
+          const safe = Math.max(1, Math.min(100, newChanCtxThreadLimit));
+          CHANNEL_CONTEXT_THREAD_LIMIT = safe;
+          CONFIG.channelContextThreadMessageLimit = safe;
+          summary.push(`channelContextThreadMessageLimit => ${safe}` + (safe !== newChanCtxThreadLimit ? ' (ajusté)' : ''));
+        }
         if (typeof newChanCtxMaxOverride === 'number') {
           const safe = Math.max(1, Math.min(50, newChanCtxMaxOverride));
           CHANNEL_CONTEXT_MAX_OVERRIDE = safe;
@@ -289,17 +308,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
           CONFIG.channelContextAutoForgetSeconds = safeSec;
           summary.push(`channelContextAutoForgetSeconds => ${safeSec}` + (safeSec !== newChanCtxAutoForget ? ' (ajusté)' : ''));
         }
-        if (typeof newAutoInterval === 'number') {
-          const safe = Math.max(30, Math.min(3600, newAutoInterval));
-          AUTO_RESPONSE_MIN_INTERVAL = safe;
-          CONFIG.autoResponseMinIntervalSeconds = safe;
-          summary.push(`autoResponseMinIntervalSeconds => ${safe}` + (safe !== newAutoInterval ? ' (ajusté)' : ''));
-        }
-        if (typeof newAutoProb === 'number') {
-          const safe = Math.min(1, Math.max(0, newAutoProb));
-          AUTO_RESPONSE_PROB = safe;
-          CONFIG.autoResponseProbability = safe;
-          summary.push(`autoResponseProbability => ${safe}` + (safe !== newAutoProb ? ' (ajusté)' : ''));
+        if (typeof newChanCtxMaxAge === 'number') {
+          const safeSec = Math.max(60, Math.min(86400, newChanCtxMaxAge));
+          CHANNEL_CONTEXT_MESSAGE_MAX_AGE_MS = safeSec * 1000;
+          CONFIG.channelContextMessageMaxAgeSeconds = safeSec;
+          summary.push(`channelContextMessageMaxAgeSeconds => ${safeSec}` + (safeSec !== newChanCtxMaxAge ? ' (ajusté)' : ''));
         }
         if (newModel) {
           if (setCurrentModel(newModel)) {
@@ -322,7 +335,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
           await interaction.reply({ content: 'Non autorisé.', flags: MessageFlags.Ephemeral });
           return;
         }
-        const sub = interaction.options.getSubcommand();
+  const sub = interaction.options.getSubcommand();
         if (sub === 'add') {
           const user = interaction.options.getUser('utilisateur', true);
           const uid = String(user.id);
@@ -401,12 +414,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const all = interaction.options.getBoolean('all') || false;
         let cleared = 0;
         if (all) {
-          cleared = channelLastContextUsage.size + lastAutoResponsePerChannel.size;
+          cleared = channelLastContextUsage.size;
           channelLastContextUsage.clear();
-          lastAutoResponsePerChannel.clear();
         } else {
           if (channelLastContextUsage.delete(interaction.channelId)) cleared++;
-          if (lastAutoResponsePerChannel.delete(interaction.channelId)) cleared++;
         }
         await interaction.reply({ content: `Contexte réinitialisé (${all?'global':'salon'}) – entrées effacées: ${cleared}.`, flags: MessageFlags.Ephemeral });
         return;
@@ -414,17 +425,8 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return; // autre commande ignorée
     }
 
-  if (!interaction.isButton()) return; // aucun bouton restant
-
-    // Bloquer les utilisateurs blacklist sur les boutons aussi
-    if (isUserBlacklisted(interaction.user.id)) {
-      if (!interaction.replied && !interaction.deferred) {
-        try { await interaction.reply({ content: 'Tu es blacklisté.', flags: MessageFlags.Ephemeral }); } catch {}
-      }
-      return;
-    }
-
-  // Plus aucun bouton géré
+  // Aucun bouton géré désormais
+  if (!interaction.isButton()) return;
   return;
   } catch (e) {
     console.error('Erreur InteractionCreate', e);

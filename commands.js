@@ -28,12 +28,14 @@ export function buildSlashCommands() {
     .addStringOption(o=>{ o.setName('model').setDescription('Changer modèle'); AVAILABLE_MODELS.forEach(m=>o.addChoices({ name:m, value:m })); return o; })
     .addBooleanOption(o=>o.setName('enablechannelcontext').setDescription('Activer contexte salon'))
     .addIntegerOption(o=>o.setName('channelcontextlimit').setDescription('Nb msgs récents (1-25)').setMinValue(1).setMaxValue(25))
+  .addIntegerOption(o=>o.setName('channelcontextthreadlimit').setDescription('Nb msgs threads/forums (1-100)').setMinValue(1).setMaxValue(100))
     .addIntegerOption(o=>o.setName('channelcontextmaxoverride').setDescription('Limite override (1-50)').setMinValue(1).setMaxValue(50))
     .addIntegerOption(o=>o.setName('channelcontextautoforget').setDescription('Auto-forget (sec,0=jamais)').setMinValue(0).setMaxValue(86400))
+  .addIntegerOption(o=>o.setName('channelcontextmaxage').setDescription('Âge max messages contexte (sec, 60-86400)').setMinValue(60).setMaxValue(86400))
   .addBooleanOption(o=>o.setName('debug').setDescription('Mode debug (logs détaillés)'))
-  .addBooleanOption(o=>o.setName('enableautoresponse').setDescription('Activer réponses automatiques pertinentes'))
-  .addIntegerOption(o=>o.setName('autoresponseinterval').setDescription('Intervalle min auto (sec, 30-3600)').setMinValue(30).setMaxValue(3600))
-  .addNumberOption(o=>o.setName('autoresponseprobability').setDescription('Proba tentative (0-1 ex:0.3)').setMinValue(0).setMaxValue(1));
+  .addBooleanOption(o=>o.setName('requiremention').setDescription('Exiger une mention ou reply pour répondre'))
+  // (options autoResponse supprimées)
+  ;
   cmds.push(optionsCmd);
 
   const opCmd = new SlashCommandBuilder()
@@ -55,6 +57,16 @@ export function buildSlashCommands() {
     .setDescription('Réinitialiser le contexte récent (admin)')
     .addBooleanOption(o=>o.setName('all').setDescription('Tout oublier (sinon seulement ce salon)'));
   cmds.push(resetCtx);
+
+  // Commande /ask (question directe sans mention obligatoire)
+  const askCmd = new SlashCommandBuilder()
+    .setName('ask')
+    .setDescription('Poser une question à l\'IA')
+    .addStringOption(o=>o.setName('texte').setDescription('Question à poser').setRequired(true).setMaxLength(4000))
+  .addStringOption(o=>{ o.setName('model').setDescription('Modèle (facultatif)'); AVAILABLE_MODELS.forEach(m=>o.addChoices({ name:m, value:m })); return o; })
+  .addBooleanOption(o=>o.setName('usecontext').setDescription('Inclure contexte récent du salon'))
+  .addBooleanOption(o=>o.setName('public').setDescription('Rendre visible à tout le monde (sinon seulement toi)'));
+  cmds.push(askCmd);
   return cmds;
 }
 
