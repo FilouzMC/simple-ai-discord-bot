@@ -478,25 +478,42 @@ client.on(Events.InteractionCreate, async (interaction) => {
             await interaction.reply({ content: 'Aucune automatisation configurée. Utilisez `/autoprompt add` pour en créer une.', flags: MessageFlags.Ephemeral });
             return;
           }
+
+          // ── Message 1 : tableau récapitulatif ────────────────────────────
           const lines = all.map(e => {
             const status = e.enabled ? '🟢' : '🔴';
             const lastRun = e.lastRunTs ? `<t:${Math.floor(e.lastRunTs/1000)}:R>` : 'jamais';
             const roleStr = e.pingRoleId ? ` • 🔔 <@&${e.pingRoleId}>` : '';
-            const promptPreview = e.prompt.length > 60 ? e.prompt.slice(0, 60).replace(/\n/g, ' ') + '…' : e.prompt.replace(/\n/g, ' ');
             return [
               `${status} **${e.name}** \`${e.id}\``,
-              `  ↳ ${scheduleToString(e.schedule)} • <#${e.channelId}>${roleStr} • dernier: ${lastRun}`,
-              `  ↳ 💬 \`${promptPreview}\``
+              `  ↳ ${scheduleToString(e.schedule)} • <#${e.channelId}>${roleStr} • dernier: ${lastRun}`
             ].join('\n');
           });
-          const header = `**Autoprompts (${all.length}):**\n`;
-          // Découpe si trop long (limite Discord : 2000 chars)
-          let out = header;
+          const header = `**Autoprompts (${all.length}) :**\n`;
+          let summary = header;
           for (const l of lines) {
-            if ((out + '\n' + l).length > 1950) { out += '\n*(liste tronquée — utilisez `/autoprompt show <id>` pour les détails)*'; break; }
-            out += '\n' + l;
+            if ((summary + '\n' + l).length > 1950) { summary += '\n*(liste tronquée)*'; break; }
+            summary += '\n' + l;
           }
-          await interaction.reply({ content: out, flags: MessageFlags.Ephemeral });
+          await interaction.reply({ content: summary, flags: MessageFlags.Ephemeral });
+
+          // ── Messages suivants : prompt complet de chaque entrée ───────────
+          for (const e of all) {
+            const prompt = e.prompt || '*(vide)*';
+            const header = `📋 **${e.name}** \`${e.id}\` — prompt complet :\n`;
+            // Découpe le prompt en tranches de 1900 chars pour rester sous la limite Discord
+            const MAX = 1900 - header.length - 8; // 8 = longueur des backticks ```\n...\n```
+            const chunks = [];
+            let remaining = prompt;
+            while (remaining.length > 0) {
+              chunks.push(remaining.slice(0, MAX));
+              remaining = remaining.slice(MAX);
+            }
+            for (let i = 0; i < chunks.length; i++) {
+              const part = chunks.length > 1 ? `${header}*(part ${i+1}/${chunks.length})*\n\`\`\`\n${chunks[i]}\n\`\`\`` : `${header}\`\`\`\n${chunks[i]}\n\`\`\``;
+              await interaction.followUp({ content: part, flags: MessageFlags.Ephemeral });
+            }
+          }
           return;
         }
 
