@@ -1,6 +1,7 @@
 import { REST, Routes, SlashCommandBuilder, ChannelType } from 'discord.js';
 import { CONFIG, AVAILABLE_MODELS, CURRENT_MODEL, setCurrentModel, saveConfig } from './lib/config.js';
 import { addBlacklist, removeBlacklist, isUserBlacklisted, listBlacklist } from './lib/blacklist.js';
+import { buildAutopromptCommand } from './lib/autoprompt_commands.js';
 
 // Fonction helper pour générer les choix de modèles pour la commande /ask
 function getAskModelChoices() {
@@ -73,6 +74,7 @@ export function buildSlashCommands() {
   .addStringOption(o=>o.setName('resumesetprompt').setDescription('Définir prompt résumé').setMaxLength(3000))
   .addBooleanOption(o=>o.setName('showresumeprompt').setDescription('Afficher prompt résumé actuel'))
   .addStringOption(o=>o.setName('autosummarymodel').setDescription('Modèle IA pour /resume (vide = aucun)'))
+  .addBooleanOption(o=>o.setName('autoprompt').setDescription('Activer/désactiver le moteur autoprompt globalement'))
   // (options autoResponse supprimées)
   ;
   cmds.push(optionsCmd);
@@ -146,6 +148,10 @@ export function buildSlashCommands() {
     .setName('forceresume')
     .setDescription('Forcer la génération d\'un résumé (admin)');
   cmds.push(forceResume);
+
+  // Commande autoprompt (admin)
+  cmds.push(buildAutopromptCommand());
+
   return cmds;
 }
 
@@ -159,4 +165,27 @@ export async function registerSlashCommands(client) {
     const data = await rest.put(route, { body: commands.map(c=>c.toJSON()) });
     if (Array.isArray(data)) data.forEach(d=>{ if (d?.name && d?.id) console.log(`[slash] ✔ ${d.name} id=${d.id}`); });
   } catch (e) { console.error('[slash] Échec enregistrement', e); }
+}
+
+/**
+ * Vide toutes les commandes enregistrées puis re-register depuis zéro.
+ * Utile pour corriger des doublons ou des options invalides côté Discord.
+ */
+export async function clearAndRegisterSlashCommands(client) {
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  const scope = CONFIG.guildId ? `guild:${CONFIG.guildId}` : 'global';
+  const route = CONFIG.guildId
+    ? Routes.applicationGuildCommands(client.user.id, CONFIG.guildId)
+    : Routes.applicationCommands(client.user.id);
+
+  console.log(`[slash] 🧹 Clear de toutes les commandes (scope=${scope})...`);
+  try {
+    await rest.put(route, { body: [] });
+    console.log('[slash] ✅ Toutes les commandes supprimées.');
+  } catch (e) {
+    console.error('[slash] Échec du clear', e);
+    return;
+  }
+
+  await registerSlashCommands(client);
 }

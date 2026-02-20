@@ -5,7 +5,16 @@ import { loadBlacklist, isUserBlacklisted, addBlacklist, removeBlacklist, listBl
 import { buildChannelContext } from './lib/context.js';
 import { generateAnswer, generateAnswerWithFallback } from './lib/ai.js';
 import { withTyping, sendAIResponse, sendAIError, buildAIEmbeds } from './lib/respond.js';
-import { registerSlashCommands } from './commands.js';
+import {
+  registerSlashCommands,
+  clearAndRegisterSlashCommands
+} from './commands.js';
+import {
+  loadAutoprompts, listAutoprompts, getAutoprompt,
+  createAutoprompt, updateAutoprompt, deleteAutoprompt,
+  setAutopromptEnabled, markAutopromptRun, getDueAutoprompts,
+  scheduleToString
+} from './lib/autoprompt.js';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -56,6 +65,9 @@ let AUTO_SUMMARY_MODEL = (typeof CONFIG.autoSummaryModel === 'string') ? CONFIG.
 const summaryState = new Map();
 const channelLastContextUsage = new Map();
 const modelUsage = new Map();
+
+// --- Autoprompt ---
+let AUTOPROMPT_ENABLED = typeof CONFIG.autopromptEnabled === 'boolean' ? CONFIG.autopromptEnabled : true;
 
 function checkAndRegisterModelUse(model){
   const cfg = getModelRateLimit(model)||{}; const cooldownMs=(cfg.cooldownSeconds||0)*1000; const maxPerHour=cfg.maxPerHour||0; const now=Date.now();
@@ -122,6 +134,101 @@ async function runChannelSummary(channel,{forced}){
   } catch(e){ console.error('[autosummary][run][error]', e); }
 }
 
+// ─── Autoprompt scheduler ────────────────────────────────────────────────────
+let _autopromptTickInterval = null;
+
+/**
+ * Exécute un autoprompt : interroge l'IA et poste la réponse dans le salon cible.
+ */
+async function runAutoprompt(entry, client, { forced = false } = {}) {
+  try {
+    const channel = await client.channels.fetch(entry.channelId).catch(() => null);
+    if (!channel || !channel.isTextBased?.()) {
+      console.warn(`[autoprompt][run] Salon introuvable ou non textuel: ${entry.channelId} (id=${entry.id})`);
+      return;
+    }
+    if (DEBUG_MODE) console.log(`[autoprompt][run] id=${entry.id} name="${entry.name}" model=${entry.model||CURRENT_MODEL} forced=${forced}`);
+
+    const modelToUse = (entry.model && AVAILABLE_MODELS.includes(entry.model)) ? entry.model : CURRENT_MODEL;
+    const rateCheck = checkAndRegisterModelUse(modelToUse);
+    if (!rateCheck.ok) {
+      console.warn(`[autoprompt][run] Rate limit pour ${modelToUse}: ${rateCheck.reason}`);
+      return;
+    }
+
+    const answerResult = await withTyping(channel, async () => {
+      const channelPrompt = getChannelPrompt(channel.id);
+      if (entry.model && AVAILABLE_MODELS.includes(entry.model)) {
+        return generateAnswer({
+          userQuestion: entry.prompt,
+          channelContext: '',
+          debug: DEBUG_MODE,
+          modelOverride: entry.model,
+          systemPromptOverride: channelPrompt
+        });
+      } else {
+        return generateAnswerWithFallback({
+          userQuestion: entry.prompt,
+          channelContext: '',
+          debug: DEBUG_MODE,
+          systemPromptOverride: channelPrompt
+        });
+      }
+    });
+
+    if (!answerResult.ok) {
+      console.error(`[autoprompt][run] Erreur IA pour id=${entry.id}: ${answerResult.error}`);
+      return;
+    }
+
+    const modelUsed = answerResult.modelUsed || modelToUse;
+
+    // Ping du rôle en message séparé avant l'embed (pour que la notif soit visible)
+    if (entry.pingRoleId) {
+      try {
+        await channel.send({ content: `<@&${entry.pingRoleId}>`, allowedMentions: { roles: [entry.pingRoleId] } });
+      } catch (e) {
+        if (DEBUG_MODE) console.warn(`[autoprompt][run] Impossible de ping le rôle ${entry.pingRoleId}:`, e?.message);
+      }
+    }
+
+    await sendAIResponse({
+      channel,
+      text: answerResult.text,
+      ms: answerResult.ms,
+      model: `autoprompt • ${modelUsed}`,
+      maxChars: MAX_ANSWER_CHARS,
+      debug: DEBUG_MODE
+    });
+
+    markAutopromptRun(entry.id);
+    if (DEBUG_MODE) console.log(`[autoprompt][run] ✅ id=${entry.id} terminé en ${answerResult.ms}ms`);
+  } catch (e) {
+    console.error(`[autoprompt][run][error] id=${entry.id}`, e);
+  }
+}
+
+/**
+ * Lance le tick toutes les 30 secondes.
+ * Vérifie quels autoprompts sont dus et les exécute.
+ */
+function startAutopromptScheduler(client) {
+  if (_autopromptTickInterval) clearInterval(_autopromptTickInterval);
+  _autopromptTickInterval = setInterval(async () => {
+    if (!AUTOPROMPT_ENABLED) return;
+    try {
+      const due = getDueAutoprompts();
+      for (const entry of due) {
+        runAutoprompt(entry, client).catch(e => console.error('[autoprompt][scheduler][error]', e));
+      }
+    } catch (e) {
+      console.error('[autoprompt][scheduler][tick][error]', e);
+    }
+  }, 30_000);
+  _autopromptTickInterval.unref?.();
+  if (DEBUG_MODE) console.log('[autoprompt] Scheduler démarré (tick 30s)');
+}
+
 // --- Client ---
 const client = new Client({
   intents: [
@@ -135,8 +242,9 @@ const client = new Client({
 
 client.once(Events.ClientReady, async () => {
   console.log(`[ready] Connecté en tant que ${client.user.tag}`);
-  try { await registerSlashCommands(client); } catch (e) { console.error('Erreur registerSlashCommands', e); }
+  try { await clearAndRegisterSlashCommands(client); } catch (e) { console.error('Erreur registerSlashCommands', e); }
   try { loadBlacklist(); } catch (e) { console.error('Erreur chargement blacklist', e); }
+  try { loadAutoprompts(); startAutopromptScheduler(client); } catch (e) { console.error('Erreur chargement autoprompts', e); }
 });
 // --- MessageCreate ---
 client.on(Events.MessageCreate, async (message) => {
@@ -223,6 +331,40 @@ client.on(Events.MessageCreate, async (message) => {
     try { await message.reply({ content: 'Erreur interne.', allowedMentions: { repliedUser: false } }); } catch {}
   }
 });
+
+// ─── Helper : construit un objet schedule depuis les options d'une interaction ─
+function _buildScheduleFromOptions(type, interaction) {
+  if (type === 'interval') {
+    const intervalMinutes = interaction.options.getInteger('interval_minutes');
+    if (!intervalMinutes || intervalMinutes < 1) throw new Error('interval_minutes requis (≥ 1) pour le type interval');
+    return { type: 'interval', intervalMinutes };
+  }
+  const hour = interaction.options.getInteger('hour');
+  if (hour === null || hour === undefined) throw new Error('hour requis pour ce type de planification');
+  const minute = interaction.options.getInteger('minute') ?? 0;
+  switch (type) {
+    case 'daily':
+      return { type: 'daily', hour, minute };
+    case 'weekly': {
+      const dow = interaction.options.getInteger('day_of_week');
+      if (dow === null || dow === undefined) throw new Error('day_of_week requis pour weekly (0=Dim … 6=Sam)');
+      return { type: 'weekly', hour, minute, dayOfWeek: dow };
+    }
+    case 'monthly': {
+      const dom = interaction.options.getInteger('day_of_month');
+      if (!dom) throw new Error('day_of_month requis pour monthly');
+      return { type: 'monthly', hour, minute, dayOfMonth: dom };
+    }
+    case 'yearly': {
+      const dom2 = interaction.options.getInteger('day_of_month');
+      const mo   = interaction.options.getInteger('month');
+      if (!dom2) throw new Error('day_of_month requis pour yearly');
+      if (!mo)   throw new Error('month requis pour yearly');
+      return { type: 'yearly', hour, minute, dayOfMonth: dom2, month: mo };
+    }
+    default: throw new Error(`Type inconnu: ${type}`);
+  }
+}
 
 // --- InteractionCreate (slash commands) ---
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -323,6 +465,188 @@ client.on(Events.InteractionCreate, async (interaction) => {
         } catch (e) {
           await interaction.editReply({ content: 'Erreur pendant l\'envoi du bloc résumé.' });
         }
+        return;
+      }
+      case 'autoprompt': {
+        if (!(await ensureAdmin())) return;
+        const sub = interaction.options.getSubcommand();
+
+        // ── list ──────────────────────────────────────────────────────────────
+        if (sub === 'list') {
+          const all = listAutoprompts();
+          if (!all.length) {
+            await interaction.reply({ content: 'Aucune automatisation configurée. Utilisez `/autoprompt add` pour en créer une.', flags: MessageFlags.Ephemeral });
+            return;
+          }
+          const lines = all.map(e => {
+            const status = e.enabled ? '🟢' : '🔴';
+            const lastRun = e.lastRunTs ? `<t:${Math.floor(e.lastRunTs/1000)}:R>` : 'jamais';
+            const roleStr = e.pingRoleId ? ` • 🔔 <@&${e.pingRoleId}>` : '';
+            const promptPreview = e.prompt.length > 60 ? e.prompt.slice(0, 60).replace(/\n/g, ' ') + '…' : e.prompt.replace(/\n/g, ' ');
+            return [
+              `${status} **${e.name}** \`${e.id}\``,
+              `  ↳ ${scheduleToString(e.schedule)} • <#${e.channelId}>${roleStr} • dernier: ${lastRun}`,
+              `  ↳ 💬 \`${promptPreview}\``
+            ].join('\n');
+          });
+          const header = `**Autoprompts (${all.length}):**\n`;
+          // Découpe si trop long (limite Discord : 2000 chars)
+          let out = header;
+          for (const l of lines) {
+            if ((out + '\n' + l).length > 1950) { out += '\n*(liste tronquée — utilisez `/autoprompt show <id>` pour les détails)*'; break; }
+            out += '\n' + l;
+          }
+          await interaction.reply({ content: out, flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        // ── show ──────────────────────────────────────────────────────────────
+        if (sub === 'show') {
+          const id = interaction.options.getString('id', true).trim();
+          const e = getAutoprompt(id);
+          if (!e) { await interaction.reply({ content: `Aucun autoprompt avec l'ID \`${id}\`.`, flags: MessageFlags.Ephemeral }); return; }
+          const lastRun = e.lastRunTs ? `<t:${Math.floor(e.lastRunTs/1000)}:f>` : 'jamais';
+          const created = `<t:${Math.floor(e.createdAt/1000)}:f>`;
+          const promptDisplay = e.prompt.length > 800 ? e.prompt.slice(0, 800) + '…' : e.prompt;
+          const lines = [
+            `**${e.name}** \`${e.id}\``,
+            `• Statut : ${e.enabled ? '🟢 Activé' : '🔴 Désactivé'}`,
+            `• Salon : <#${e.channelId}>`,
+            `• Ping rôle : ${e.pingRoleId ? `<@&${e.pingRoleId}>` : '*(aucun)*'}`,
+            `• Modèle : ${e.model || '*(modèle courant)*'}`,
+            `• Planification : ${scheduleToString(e.schedule)}`,
+            `• Dernier déclenchement : ${lastRun}`,
+            `• Créé le : ${created}`,
+            `• Prompt :\n\`\`\`\n${promptDisplay}\n\`\`\``
+          ];
+          await interaction.reply({ content: lines.join('\n'), flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        // ── add ───────────────────────────────────────────────────────────────
+        if (sub === 'add') {
+          const name    = interaction.options.getString('name', true);
+          const prompt  = interaction.options.getString('prompt', true).trim();
+          const channel = interaction.options.getChannel('channel', true);
+          const type    = interaction.options.getString('type', true);
+          const model   = interaction.options.getString('model') || '';
+          const role    = interaction.options.getRole('role');
+          const pingRoleId = role ? role.id : '';
+
+          // Construire le schedule selon le type
+          let schedule;
+          try {
+            schedule = _buildScheduleFromOptions(type, interaction);
+          } catch (err) {
+            await interaction.reply({ content: `❌ Paramètre invalide : ${err.message}`, flags: MessageFlags.Ephemeral });
+            return;
+          }
+
+          let entry;
+          try {
+            entry = createAutoprompt({ name, channelId: channel.id, pingRoleId, model, prompt, schedule });
+          } catch (err) {
+            await interaction.reply({ content: `❌ Erreur création : ${err.message}`, flags: MessageFlags.Ephemeral });
+            return;
+          }
+          await interaction.reply({
+            content: `✅ Autoprompt **${entry.name}** créé (\`${entry.id}\`).\n• Planification : ${scheduleToString(entry.schedule)}\n• Salon : <#${entry.channelId}>${entry.pingRoleId ? `\n• Ping rôle : <@&${entry.pingRoleId}>` : ''}`,
+            flags: MessageFlags.Ephemeral
+          });
+          return;
+        }
+
+        // ── edit ──────────────────────────────────────────────────────────────
+        if (sub === 'edit') {
+          const id = interaction.options.getString('id', true).trim();
+          if (!getAutoprompt(id)) { await interaction.reply({ content: `Aucun autoprompt \`${id}\`.`, flags: MessageFlags.Ephemeral }); return; }
+
+          const patch = {};
+          const newName    = interaction.options.getString('name');
+          const newPrompt  = interaction.options.getString('prompt');
+          const newChannel = interaction.options.getChannel('channel');
+          const newModel   = interaction.options.getString('model');
+          const newType    = interaction.options.getString('type');
+          // Pour le rôle : getRole retourne null si non fourni, donc on distingue
+          // "non fourni" (undefined dans les options) de "fourni vide" (impossible via role picker).
+          // On utilise une option string séparée "clear_role" pour supprimer le ping.
+          const newRole = interaction.options.getRole('role');
+          const clearRole = interaction.options.getBoolean('clear_role');
+          if (clearRole) patch.pingRoleId = '';
+          else if (newRole !== null && newRole !== undefined) patch.pingRoleId = newRole.id;
+
+          if (newName)    patch.name      = newName;
+          if (newPrompt)  patch.prompt    = newPrompt;
+          if (newChannel) patch.channelId = newChannel.id;
+          if (newModel !== null && newModel !== undefined) patch.model = newModel;
+
+          if (newType) {
+            try {
+              patch.schedule = _buildScheduleFromOptions(newType, interaction);
+            } catch (err) {
+              await interaction.reply({ content: `❌ Paramètre invalide : ${err.message}`, flags: MessageFlags.Ephemeral });
+              return;
+            }
+          }
+
+          if (!Object.keys(patch).length) {
+            await interaction.reply({ content: 'Aucune modification fournie.', flags: MessageFlags.Ephemeral });
+            return;
+          }
+
+          try {
+            updateAutoprompt(id, patch);
+          } catch (err) {
+            await interaction.reply({ content: `❌ Erreur mise à jour : ${err.message}`, flags: MessageFlags.Ephemeral });
+            return;
+          }
+          const updated = getAutoprompt(id);
+          await interaction.reply({
+            content: `✅ Autoprompt \`${id}\` mis à jour.\n• Planification : ${scheduleToString(updated.schedule)}\n• Salon : <#${updated.channelId}>${updated.pingRoleId ? `\n• Ping rôle : <@&${updated.pingRoleId}>` : '\n• Ping rôle : *(aucun)*'}`,
+            flags: MessageFlags.Ephemeral
+          });
+          return;
+        }
+
+        // ── delete ────────────────────────────────────────────────────────────
+        if (sub === 'delete') {
+          const id = interaction.options.getString('id', true).trim();
+          const entry = getAutoprompt(id);
+          if (!entry) { await interaction.reply({ content: `Aucun autoprompt \`${id}\`.`, flags: MessageFlags.Ephemeral }); return; }
+          deleteAutoprompt(id);
+          await interaction.reply({ content: `🗑️ Autoprompt **${entry.name}** (\`${id}\`) supprimé.`, flags: MessageFlags.Ephemeral });
+          return;
+        }
+
+        // ── enable / disable ──────────────────────────────────────────────────
+        if (sub === 'enable' || sub === 'disable') {
+          const id = interaction.options.getString('id', true).trim();
+          const entry = getAutoprompt(id);
+          if (!entry) { await interaction.reply({ content: `Aucun autoprompt \`${id}\`.`, flags: MessageFlags.Ephemeral }); return; }
+          setAutopromptEnabled(id, sub === 'enable');
+          await interaction.reply({
+            content: `${sub === 'enable' ? '🟢 Activé' : '🔴 Désactivé'} : **${entry.name}** (\`${id}\`)`,
+            flags: MessageFlags.Ephemeral
+          });
+          return;
+        }
+
+        // ── run (force) ───────────────────────────────────────────────────────
+        if (sub === 'run') {
+          const id = interaction.options.getString('id', true).trim();
+          const entry = getAutoprompt(id);
+          if (!entry) { await interaction.reply({ content: `Aucun autoprompt \`${id}\`.`, flags: MessageFlags.Ephemeral }); return; }
+          await interaction.deferReply({ ephemeral: true });
+          try {
+            await runAutoprompt(entry, client, { forced: true });
+            await interaction.editReply({ content: `✅ Autoprompt **${entry.name}** déclenché manuellement dans <#${entry.channelId}>.` });
+          } catch (e) {
+            await interaction.editReply({ content: `❌ Erreur lors de l'exécution : ${e.message}` });
+          }
+          return;
+        }
+
+        await interaction.reply({ content: 'Sous-commande inconnue.', flags: MessageFlags.Ephemeral });
         return;
       }
       case 'blacklist': {
@@ -441,7 +765,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const showResumePrompt = interaction.options.getBoolean('showresumeprompt');
 
   if (showResumePrompt || (newMaxChars === null && !newModel && newEnableChanCtx === null && newChanCtxLimit === null && newChanCtxThreadLimit === null && newDebugLog === null && newChanCtxMaxOverride === null && newChanCtxAutoForget === null && newChanCtxMaxAge === null && newAutoSummaryEnabled === null && newAutoSummaryIdle === null && newAutoSummaryMin === null && newAutoSummaryContextLimit === null && !newAutoSummaryPrompt && !newAutoSummaryModel)) {
-          await interaction.reply({ content: `Valeurs actuelles:\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}\n- enableChannelContext: ${ENABLE_CHANNEL_CONTEXT}\n- channelContextMessageLimit: ${CHANNEL_CONTEXT_LIMIT}\n- channelContextThreadMessageLimit: ${CHANNEL_CONTEXT_THREAD_LIMIT}\n- channelContextMaxOverride: ${CHANNEL_CONTEXT_MAX_OVERRIDE}\n- channelContextAutoForgetSeconds: ${CHANNEL_CONTEXT_AUTO_FORGET_MS/1000}\n- channelContextMessageMaxAgeSeconds: ${CHANNEL_CONTEXT_MESSAGE_MAX_AGE_MS/1000}\n- requireMentionOrReply: ${REQUIRE_MENTION_OR_REPLY}\n- debug: ${DEBUG_MODE}\n- currentModel: ${CURRENT_MODEL}\n- autoSummaryEnabled: ${AUTO_SUMMARY_ENABLED}\n- autoSummaryIdleSeconds: ${AUTO_SUMMARY_IDLE_SECONDS}\n- autoSummaryMinMessages: ${AUTO_SUMMARY_MIN_MESSAGES}\n- autoSummaryContextLimit: ${AUTO_SUMMARY_CONTEXT_LIMIT}\n- autoSummaryModel: ${AUTO_SUMMARY_MODEL||'(aucun)'}\n- resumePromptLength: ${AUTO_SUMMARY_PROMPT.length}\n- availableModels: ${AVAILABLE_MODELS.join(', ')}` , flags: MessageFlags.Ephemeral });
+          await interaction.reply({ content: `Valeurs actuelles:\n- maxAnswerCharsPerMessage: ${MAX_ANSWER_CHARS}\n- enableChannelContext: ${ENABLE_CHANNEL_CONTEXT}\n- channelContextMessageLimit: ${CHANNEL_CONTEXT_LIMIT}\n- channelContextThreadMessageLimit: ${CHANNEL_CONTEXT_THREAD_LIMIT}\n- channelContextMaxOverride: ${CHANNEL_CONTEXT_MAX_OVERRIDE}\n- channelContextAutoForgetSeconds: ${CHANNEL_CONTEXT_AUTO_FORGET_MS/1000}\n- channelContextMessageMaxAgeSeconds: ${CHANNEL_CONTEXT_MESSAGE_MAX_AGE_MS/1000}\n- requireMentionOrReply: ${REQUIRE_MENTION_OR_REPLY}\n- debug: ${DEBUG_MODE}\n- currentModel: ${CURRENT_MODEL}\n- autoSummaryEnabled: ${AUTO_SUMMARY_ENABLED}\n- autoSummaryIdleSeconds: ${AUTO_SUMMARY_IDLE_SECONDS}\n- autoSummaryMinMessages: ${AUTO_SUMMARY_MIN_MESSAGES}\n- autoSummaryContextLimit: ${AUTO_SUMMARY_CONTEXT_LIMIT}\n- autoSummaryModel: ${AUTO_SUMMARY_MODEL||'(aucun)'}\n- resumePromptLength: ${AUTO_SUMMARY_PROMPT.length}\n- autopromptEnabled: ${AUTOPROMPT_ENABLED}\n- availableModels: ${AVAILABLE_MODELS.join(', ')}` , flags: MessageFlags.Ephemeral });
           return;
         }
         const summary = [];
@@ -460,6 +784,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         if (typeof newAutoSummaryContextLimit === 'number') { const safe = Math.max(10, Math.min(200, newAutoSummaryContextLimit)); AUTO_SUMMARY_CONTEXT_LIMIT = safe; CONFIG.autoSummaryContextLimit = safe; summary.push(`autoSummaryContextLimit => ${safe}` + (safe !== newAutoSummaryContextLimit ? ' (ajusté)' : '')); }
   if (typeof newAutoSummaryPrompt === 'string' && newAutoSummaryPrompt.trim()) { AUTO_SUMMARY_PROMPT = newAutoSummaryPrompt.trim(); CONFIG.autoSummaryPrompt = AUTO_SUMMARY_PROMPT; summary.push(`autoSummaryPrompt => (len ${AUTO_SUMMARY_PROMPT.length})`); }
   if (typeof newAutoSummaryModel === 'string') { AUTO_SUMMARY_MODEL = newAutoSummaryModel.trim(); CONFIG.autoSummaryModel = AUTO_SUMMARY_MODEL; summary.push(`autoSummaryModel => ${AUTO_SUMMARY_MODEL || '(aucun)'}`); }
+        // autoprompt global on/off
+        const newAutopromptEnabled = interaction.options.getBoolean('autoprompt');
+        if (newAutopromptEnabled !== null && newAutopromptEnabled !== undefined) { AUTOPROMPT_ENABLED = newAutopromptEnabled; CONFIG.autopromptEnabled = AUTOPROMPT_ENABLED; summary.push(`autopromptEnabled => ${AUTOPROMPT_ENABLED}`); }
         saveConfig();
         await interaction.reply({ content: `Options mises à jour:\n${summary.join('\n')}`, flags: MessageFlags.Ephemeral });
         return;
